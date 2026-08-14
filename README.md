@@ -42,7 +42,7 @@ npm run build
 ## 標註流程
 
 1. 上傳 MP4 並設定研究片段起訖點。
-2. 框選受試者臉部；工具只在該 ROI 裁切畫面內偵測，避免選到刺激影片中的人物。
+2. 框選受試者第一幀臉部作為身份錨點；工具會以此初始化移動搜尋視窗，逐幀跟隨受試者並降低選到刺激影片人物的風險。虛線框是起始錨點，提取與標註階段的實線框才是每個 10 Hz 樣本的實際偵測位置。
 3. 工具依固定 10 Hz canonical timestamps seek、解碼並完成一次特徵提取，隨後鎖定特徵。
 4. 分兩次播放標註 Valence 與 Arousal。滑桿事件以 causal zero-order hold 對齊同一組 `sample_index`，不使用未來值回填。
 5. 填寫匿名 participant/session/stimulus/trial 資訊並執行 QA。

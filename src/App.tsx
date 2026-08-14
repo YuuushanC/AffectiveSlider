@@ -22,6 +22,7 @@ import { readClientEnvironment, readCompatibilityIssues } from "./lib/clientEnvi
 import { clearDraft, fingerprintVideo, loadDraft, saveDraft, type SessionDraft } from "./lib/draftStore";
 import { buildExportBundle, downloadBlob } from "./lib/exportBundle";
 import { clampRect, createFaceLandmarker, detectFace, LANDMARK_MODEL_VERSION } from "./lib/facePipeline";
+import { advanceTrackingRoi, trackedRoiForTime } from "./lib/tracking";
 import { RESEARCH_PROTOCOL } from "./protocol";
 import type { AnnotationSample, AuditEvent, Mode, Rect, SessionMetadata, Step } from "./types";
 
@@ -47,6 +48,7 @@ export function App() {
   const labelTrajectoryRef = useRef<Record<"valence" | "arousal", Array<{ mediaTime: number; value: number }>>>({ valence: [], arousal: [] });
   const extractionCancelledRef = useRef(false);
   const restoreCandidateRef = useRef<SessionDraft | null>(null);
+  const extractionTrackedRoiRef = useRef<Rect | null>(null);
   const [videoFile, setVideoFile] = useState<File | null>(null);
   const [videoUrl, setVideoUrl] = useState("");
   const [duration, setDuration] = useState(0);
@@ -305,7 +307,14 @@ export function App() {
       drawTrimMask(ctx, canvas.width, canvas.height);
     }
 
-    if (roi) drawRoi(ctx, roi);
+    if (isExtracting) {
+      if (extractionTrackedRoiRef.current) drawRoi(ctx, extractionTrackedRoiRef.current, true);
+    } else if (step === "roi" && roi) {
+      drawRoi(ctx, roi, false);
+    } else if (step === "annotate") {
+      const trackedRoi = trackedRoiForTime(samples, video.currentTime, clipStart, FPS);
+      if (trackedRoi) drawRoi(ctx, trackedRoi, true);
+    }
   };
 
   const drawTrimMask = (ctx: CanvasRenderingContext2D, width: number, height: number) => {
@@ -316,12 +325,23 @@ export function App() {
     ctx.fillRect(endX, 0, width - endX, height);
   };
 
-  const drawRoi = (ctx: CanvasRenderingContext2D, rect: Rect) => {
+  const drawRoi = (ctx: CanvasRenderingContext2D, rect: Rect, tracked: boolean) => {
     ctx.save();
     ctx.strokeStyle = "#0f9f87";
     ctx.lineWidth = Math.max(3, rect.size * 0.01);
-    ctx.setLineDash([12, 8]);
+    ctx.setLineDash(tracked ? [] : [12, 8]);
     ctx.strokeRect(rect.x, rect.y, rect.size, rect.size);
+    if (tracked) {
+      const fontSize = Math.max(14, Math.min(24, rect.size * 0.075));
+      const label = "TRACKED FACE";
+      ctx.font = `700 ${fontSize}px sans-serif`;
+      const labelWidth = ctx.measureText(label).width + 16;
+      const labelY = Math.max(fontSize + 6, rect.y - 8);
+      ctx.fillStyle = "#0f9f87";
+      ctx.fillRect(rect.x, labelY - fontSize - 6, labelWidth, fontSize + 8);
+      ctx.fillStyle = "#ffffff";
+      ctx.fillText(label, rect.x + 8, labelY - 4);
+    }
     ctx.restore();
   };
 
@@ -368,6 +388,7 @@ export function App() {
     setIsExtracting(true);
     setExtractionProgress(0);
     setExtractionError("");
+    extractionTrackedRoiRef.current = null;
     setValenceDone(false);
     setArousalDone(false);
     labelTrajectoryRef.current = { valence: [], arousal: [] };
@@ -377,10 +398,18 @@ export function App() {
       const detector = await createFaceLandmarker();
       landmarkerRef.current = detector;
       const timeline = createTimeline(clipStart, clipEnd, FPS);
+      let trackingRoi = selectedRoi;
       for (const [sampleIndex, sample] of timeline) {
         if (extractionCancelledRef.current) return;
         const decodedFrame = await seekToDecodedFrame(video, sample.targetTime);
-        const observation = detectFace(detector, video, sampleIndex * (1000 / FPS), selectedRoi);
+        const observation = detectFace(detector, video, sampleIndex * (1000 / FPS), trackingRoi);
+        if (observation.detected && observation.identityMatch && observation.roi) {
+          extractionTrackedRoiRef.current = observation.roi;
+          trackingRoi = advanceTrackingRoi(trackingRoi, observation.roi, video.videoWidth, video.videoHeight);
+        } else {
+          // A missing frame remains visibly and analytically missing; never draw a stale face box.
+          extractionTrackedRoiRef.current = null;
+        }
         timeline.set(sampleIndex, {
           ...sample,
           sourceTimestamp: decodedFrame.mediaTime,
@@ -426,6 +455,7 @@ export function App() {
       console.error(error);
       setExtractionError(error instanceof Error ? error.message : "特徵提取失敗");
     } finally {
+      extractionTrackedRoiRef.current = null;
       setIsExtracting(false);
     }
   };
@@ -536,8 +566,8 @@ export function App() {
       annotationDelaySec: RESEARCH_PROTOCOL.annotationDelaySec,
       smoothingWindowSec: RESEARCH_PROTOCOL.smoothingWindowSec,
       annotatedAt: new Date().toISOString(),
-      toolVersion: "0.4.0", landmarkModelVersion: LANDMARK_MODEL_VERSION,
-      schemaVersion: "2.2.0", processingVersion: "roi-preextract-10hz-v2",
+      toolVersion: "0.4.1", landmarkModelVersion: LANDMARK_MODEL_VERSION,
+      schemaVersion: "2.2.0", processingVersion: "roi-dynamic-track-10hz-v3",
       protocolVersion: RESEARCH_PROTOCOL.protocolVersion,
       targetConstruct: RESEARCH_PROTOCOL.targetConstruct,
       ...client,
@@ -725,7 +755,7 @@ export function App() {
                 {step === "clip" ? "影片剪輯" : step === "roi" ? "臉部位置標註" : mode === "arousal" ? "喚醒度標註" : "愉悅度標註"}
               </CardTitle>
               <p className="panel-description">
-                {step === "clip" ? "先設定影片起訖點，畫面遮罩會標示捨棄片段。" : step === "roi" ? "在影片畫面滑動框選正方形臉部 ROI，後續會依此追蹤。" : "分兩階段錄製愉悅度與喚醒度，完成後執行 QA 並下載 ZIP。"}
+                {step === "clip" ? "先設定影片起訖點，畫面遮罩會標示捨棄片段。" : step === "roi" ? "框選第一幀臉部作為身份錨點；提取後實線框會逐幀跟隨臉部。" : "分兩階段錄製愉悅度與喚醒度；綠色實線框顯示每個 10 Hz 樣本的實際偵測位置。"}
               </p>
             </CardHeader>
             <CardContent className="control-content">
@@ -744,8 +774,8 @@ export function App() {
                   <div className="roi-card">
                     <SquareDashedMousePointer size={22} />
                     <div>
-                      <strong>{roi && roi.size >= 24 ? "ROI 已選取" : "等待框選臉部"}</strong>
-                      <span>{roi ? `${Math.round(roi.size)} x ${Math.round(roi.size)} px` : "請在左側影片上拖曳出正方形範圍"}</span>
+                      <strong>{roi && roi.size >= 24 ? "身份錨點已選取" : "等待框選臉部"}</strong>
+                      <span>{roi ? `${Math.round(roi.size)} x ${Math.round(roi.size)} px；虛線只標示起始位置` : "請在左側影片上拖曳出正方形範圍"}</span>
                     </div>
                   </div>
                   <div className="two-actions">
@@ -757,7 +787,7 @@ export function App() {
                     </Button>
                   </div>
                   <p className={modelStatus === "error" ? "dialog-error" : "panel-description"}>
-                    {browserIncompatible ? "瀏覽器相容性檢查未通過，無法開始正式標註" : isExtracting ? "正在 ROI 內依固定 10 Hz 時間點預先提取；完成後特徵將鎖定。" : modelStatus === "ready" ? "真實臉部特徵模型已就緒" : modelStatus === "error" ? "臉部特徵模型載入失敗，無法開始正式標註" : "正在載入臉部特徵模型…"}
+                    {browserIncompatible ? "瀏覽器相容性檢查未通過，無法開始正式標註" : isExtracting ? "正在以移動追蹤視窗依固定 10 Hz 時間點預先提取；完成後特徵將鎖定。" : modelStatus === "ready" ? "真實臉部特徵模型已就緒" : modelStatus === "error" ? "臉部特徵模型載入失敗，無法開始正式標註" : "正在載入臉部特徵模型…"}
                   </p>
                   {extractionError ? <p className="dialog-error">{extractionError}</p> : null}
                 </div>

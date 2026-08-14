@@ -1,5 +1,6 @@
 import { FaceLandmarker, FilesetResolver } from "@mediapipe/tasks-vision";
 import type { HeadPose, Point, Rect } from "../types";
+import { isPlausibleTrack } from "./tracking";
 
 export const LANDMARK_COUNT = 478;
 export const LANDMARK_MODEL_VERSION = "mediapipe-face-landmarker-float16-v1";
@@ -61,10 +62,11 @@ export function detectFace(
   detector: FaceLandmarker,
   video: HTMLVideoElement,
   timestampMs: number,
-  selectedRoi: Rect,
+  expectedRoi: Rect,
 ): FaceObservation {
-  // Crop before inference so faces in the stimulus/screen area cannot be selected.
-  const crop = expandedRect(selectedRoi, video.videoWidth, video.videoHeight, 0.35);
+  // Follow the previously detected participant face. The first frame is seeded by
+  // the manually selected ROI, preventing a face inside the stimulus from taking over.
+  const crop = expandedRect(expectedRoi, video.videoWidth, video.videoHeight, 0.75);
   const cropCanvas = document.createElement("canvas");
   cropCanvas.width = Math.max(1, Math.round(crop.size));
   cropCanvas.height = Math.max(1, Math.round(crop.size));
@@ -83,8 +85,8 @@ export function detectFace(
   }));
   const normalizedLandmarks = normalizeLandmarks(landmarks);
   const detectedRoi = boundsFor(landmarks, video.videoWidth, video.videoHeight);
-  const roiOverlap = intersectionOverUnion(selectedRoi, detectedRoi);
-  const identityMatch = roiOverlap >= 0.1 && centerInside(detectedRoi, expandedRect(selectedRoi, video.videoWidth, video.videoHeight, 0.2));
+  const roiOverlap = intersectionOverUnion(expectedRoi, detectedRoi);
+  const identityMatch = isPlausibleTrack(expectedRoi, detectedRoi);
   const matrix = result.facialTransformationMatrixes?.[0]?.data;
   const headPose = matrix ? poseFromMatrix(Array.from(matrix)) : { pitch: null, yaw: null, roll: null };
   const blendshapes = Object.fromEntries(
@@ -195,12 +197,6 @@ function intersectionOverUnion(a: Rect, b: Rect) {
   const bottom = Math.min(a.y + a.size, b.y + b.size);
   const intersection = Math.max(0, right - left) * Math.max(0, bottom - top);
   return intersection / (a.size * a.size + b.size * b.size - intersection || 1);
-}
-
-function centerInside(inner: Rect, outer: Rect) {
-  const x = inner.x + inner.size / 2;
-  const y = inner.y + inner.size / 2;
-  return x >= outer.x && x <= outer.x + outer.size && y >= outer.y && y <= outer.y + outer.size;
 }
 
 function allFinite(points: Point[]) {
