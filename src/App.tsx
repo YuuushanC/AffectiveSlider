@@ -566,7 +566,7 @@ export function App() {
       annotationDelaySec: RESEARCH_PROTOCOL.annotationDelaySec,
       smoothingWindowSec: RESEARCH_PROTOCOL.smoothingWindowSec,
       annotatedAt: new Date().toISOString(),
-      toolVersion: "0.4.1", landmarkModelVersion: LANDMARK_MODEL_VERSION,
+      toolVersion: "0.4.2", landmarkModelVersion: LANDMARK_MODEL_VERSION,
       schemaVersion: "2.2.0", processingVersion: "roi-dynamic-track-10hz-v3",
       protocolVersion: RESEARCH_PROTOCOL.protocolVersion,
       targetConstruct: RESEARCH_PROTOCOL.targetConstruct,

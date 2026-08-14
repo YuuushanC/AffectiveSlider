@@ -464,7 +464,7 @@ input[type="range"]::-webkit-slider-thumb {
 
 .panel-title {
   font-size: 1.75rem;
-  font-weight: 900;
+  font-weight: 700;
   line-height: 1.1;
 }
 
@@ -644,18 +644,20 @@ input[type="range"]::-webkit-slider-thumb {
 
 .studio-notice strong {
   font-size: .88rem;
-  font-weight: 900;
+  font-weight: 700;
 }
 
-.studio-notice span,
-.draft-status {
+.studio-notice span {
   margin-top: .12rem;
   font-size: .76rem;
-  font-weight: 650;
+  font-weight: 400;
 }
 
 .draft-status {
+  margin-top: .12rem;
   color: hsl(var(--muted-foreground));
+  font-size: .76rem;
+  font-weight: 650;
   text-align: right;
 }
 
