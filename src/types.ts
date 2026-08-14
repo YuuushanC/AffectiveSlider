@@ -27,6 +27,8 @@ export interface AnnotationSample {
   valenceRaw: number | null;
   arousalRaw: number | null;
   faceDetected: boolean;
+  identityMatch: boolean;
+  roiOverlap: number | null;
   detectionConfidence: number | null;
   trackingConfidence: number | null;
   qualityFlags: string[];
@@ -37,6 +39,7 @@ export interface AnnotationSample {
   normalizedLandmarks: Point[];
   headPose: HeadPose;
   geometry: Record<string, number>;
+  blendshapes: Record<string, number>;
 }
 
 export interface AuditEvent {
@@ -57,7 +60,7 @@ export interface SessionMetadata {
   stimulusEmotion: string;
   stimulusOrder: number;
   experimentalCondition: string;
-  videoOriginalName: string;
+  sourceVideoSizeBytes: number;
   videoDurationSec: number;
   clipStartSec: number;
   clipEndSec: number;
@@ -70,6 +73,15 @@ export interface SessionMetadata {
   landmarkModelVersion: string;
   schemaVersion: string;
   processingVersion: string;
+  protocolVersion: string;
+  targetConstruct: string;
+  browserFamily: string;
+  browserMajorVersion: string | null;
+  operatingSystem: string;
+  viewportWidth: number;
+  viewportHeight: number;
+  devicePixelRatio: number;
+  touchPoints: number;
 }
 
 export interface QaReport {
@@ -79,10 +91,17 @@ export interface QaReport {
   timelineCompleteness: number;
   labelCompleteness: number;
   validFaceRate: number;
+  processedLabelCompleteness: number;
+  featureVariation: number;
   duplicateSampleIndices: number[];
+  unexpectedSampleIndices: number[];
   irregularTimeSteps: number[];
   missingFaceSamples: number[];
   missingLabelSamples: number[];
+  invalidIdentitySamples: number[];
+  invalidSourceTimeSamples: number[];
+  nonFiniteFeatureSamples: number[];
+  warnings: string[];
   constantValenceRuns: number;
   constantArousalRuns: number;
   valenceJumps: number;
