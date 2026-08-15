@@ -43,11 +43,32 @@ export interface AnnotationSample {
 }
 
 export interface AuditEvent {
-  event: "pause" | "play" | "seek" | "label_change" | "dropped_sample";
+  event: "pause" | "play" | "seek" | "label_change" | "dropped_sample" | "track_reacquired";
   mediaTime: number;
   recordedAt: string;
   mode: Mode;
   detail?: string;
+}
+
+export interface InvalidFaceSegment {
+  startSampleIndex: number;
+  endSampleIndex: number;
+  startTimeSec: number;
+  endTimeSec: number;
+  sampleCount: number;
+  reasons: string[];
+}
+
+export interface FeatureQaReport {
+  passed: boolean;
+  sampleCount: number;
+  validFaceCount: number;
+  invalidFaceCount: number;
+  validFaceRate: number;
+  featureVariation: number;
+  invalidReasonCounts: Record<string, number>;
+  invalidFaceSegments: InvalidFaceSegment[];
+  rejectionReasons: string[];
 }
 
 export interface SessionMetadata {
@@ -101,6 +122,8 @@ export interface QaReport {
   invalidIdentitySamples: number[];
   invalidSourceTimeSamples: number[];
   nonFiniteFeatureSamples: number[];
+  invalidReasonCounts: Record<string, number>;
+  invalidFaceSegments: InvalidFaceSegment[];
   warnings: string[];
   constantValenceRuns: number;
   constantArousalRuns: number;

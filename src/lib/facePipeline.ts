@@ -1,6 +1,7 @@
 import { FaceLandmarker, FilesetResolver } from "@mediapipe/tasks-vision";
 import type { HeadPose, Point, Rect } from "../types";
-import { isPlausibleTrack } from "./tracking";
+import { RESEARCH_PROTOCOL } from "../protocol";
+import { isPlausibleTrack, trackMetrics, type FaceSearchPlan } from "./tracking";
 
 export const LANDMARK_COUNT = 478;
 export const LANDMARK_MODEL_VERSION = "mediapipe-face-landmarker-float16-v1";
@@ -21,7 +22,7 @@ export async function createFaceLandmarker() {
   const options = {
     baseOptions: { modelAssetPath: "/models/face_landmarker.task", delegate: "GPU" },
     runningMode: "VIDEO",
-    numFaces: 1,
+    numFaces: 2,
     minFaceDetectionConfidence: 0.5,
     minFacePresenceConfidence: 0.5,
     minTrackingConfidence: 0.5,
@@ -63,40 +64,64 @@ export function detectFace(
   video: HTMLVideoElement,
   timestampMs: number,
   expectedRoi: Rect,
+  searchPlan: FaceSearchPlan = {
+    padding: RESEARCH_PROTOCOL.trackedSearchPadding,
+    fullFrame: false,
+    maximumNormalizedDistance: 0.85,
+    mode: "tracked",
+  },
 ): FaceObservation {
   // Follow the previously detected participant face. The first frame is seeded by
   // the manually selected ROI, preventing a face inside the stimulus from taking over.
-  const crop = expandedRect(expectedRoi, video.videoWidth, video.videoHeight, 0.75);
-  const cropCanvas = document.createElement("canvas");
-  cropCanvas.width = Math.max(1, Math.round(crop.size));
-  cropCanvas.height = Math.max(1, Math.round(crop.size));
-  const context = cropCanvas.getContext("2d");
+  const surface = createDetectionSurface(video, expectedRoi, searchPlan);
+  const context = surface.canvas.getContext("2d");
   if (!context) return emptyObservation("crop_context_unavailable");
-  context.drawImage(video, crop.x, crop.y, crop.size, crop.size, 0, 0, cropCanvas.width, cropCanvas.height);
+  context.drawImage(
+    video,
+    surface.sourceX,
+    surface.sourceY,
+    surface.sourceWidth,
+    surface.sourceHeight,
+    0,
+    0,
+    surface.canvas.width,
+    surface.canvas.height,
+  );
 
-  const result = detector.detectForVideo(cropCanvas, timestampMs);
-  const face = result.faceLandmarks[0];
-  if (!face || face.length < LANDMARK_COUNT) return emptyObservation("face_not_detected");
+  const result = detector.detectForVideo(surface.canvas, timestampMs);
+  const candidates = result.faceLandmarks
+    .map((face, index) => {
+      if (face.length < LANDMARK_COUNT) return null;
+      const landmarks = face.slice(0, LANDMARK_COUNT).map((point) => ({
+        x: round(surface.sourceX + point.x * surface.sourceWidth),
+        y: round(surface.sourceY + point.y * surface.sourceHeight),
+        z: round(point.z * surface.sourceWidth),
+      }));
+      const roi = boundsFor(landmarks, video.videoWidth, video.videoHeight);
+      const metrics = trackMetrics(expectedRoi, roi);
+      const score = metrics.normalizedDistance + Math.abs(Math.log(Math.max(metrics.sizeRatio, 1e-6))) * 0.35;
+      return { face, index, landmarks, roi, score };
+    })
+    .filter((candidate): candidate is NonNullable<typeof candidate> => candidate !== null)
+    .sort((a, b) => a.score - b.score);
+  const candidate = candidates[0];
+  if (!candidate) return emptyObservation("face_not_detected");
 
-  const landmarks = face.slice(0, LANDMARK_COUNT).map((point) => ({
-    x: round(crop.x + point.x * crop.size),
-    y: round(crop.y + point.y * crop.size),
-    z: round(point.z * crop.size),
-  }));
+  const { face, index, landmarks, roi: detectedRoi } = candidate;
   const normalizedLandmarks = normalizeLandmarks(landmarks);
-  const detectedRoi = boundsFor(landmarks, video.videoWidth, video.videoHeight);
   const roiOverlap = intersectionOverUnion(expectedRoi, detectedRoi);
-  const identityMatch = isPlausibleTrack(expectedRoi, detectedRoi);
-  const matrix = result.facialTransformationMatrixes?.[0]?.data;
+  const identityMatch = isPlausibleTrack(expectedRoi, detectedRoi, searchPlan.maximumNormalizedDistance);
+  const matrix = result.facialTransformationMatrixes?.[index]?.data;
   const headPose = matrix ? poseFromMatrix(Array.from(matrix)) : { pitch: null, yaw: null, roll: null };
   const blendshapes = Object.fromEntries(
-    (result.faceBlendshapes?.[0]?.categories ?? []).map((category) => [category.categoryName, round(category.score)]),
+    (result.faceBlendshapes?.[index]?.categories ?? []).map((category) => [category.categoryName, round(category.score)]),
   );
   const qualityFlags: string[] = [];
   if (!identityMatch) qualityFlags.push("identity_roi_mismatch");
-  if (face.some((point) => point.x < 0 || point.x > 1 || point.y < 0 || point.y > 1)) qualityFlags.push("partially_out_of_crop");
-  if (detectedRoi.size < 80) qualityFlags.push("face_too_small");
+  if (isPartiallyOutOfCrop(face)) qualityFlags.push("partially_out_of_crop");
+  if (detectedRoi.size < minimumFaceSizeForFrame(video.videoWidth, video.videoHeight)) qualityFlags.push("face_too_small");
   if (!allFinite(landmarks) || !allFinite(normalizedLandmarks)) qualityFlags.push("non_finite_landmarks");
+  if (searchPlan.mode !== "tracked") qualityFlags.push(`search_${searchPlan.mode}`);
 
   return {
     detected: true,
@@ -110,6 +135,48 @@ export function detectFace(
     blendshapes,
     qualityFlags,
   };
+}
+
+interface DetectionSurface {
+  canvas: HTMLCanvasElement;
+  sourceX: number;
+  sourceY: number;
+  sourceWidth: number;
+  sourceHeight: number;
+}
+
+function createDetectionSurface(video: HTMLVideoElement, expectedRoi: Rect, searchPlan: FaceSearchPlan): DetectionSurface {
+  const canvas = document.createElement("canvas");
+  const source = searchPlan.fullFrame
+    ? { x: 0, y: 0, width: video.videoWidth, height: video.videoHeight }
+    : (() => {
+        const crop = expandedRect(expectedRoi, video.videoWidth, video.videoHeight, searchPlan.padding);
+        return { x: crop.x, y: crop.y, width: crop.size, height: crop.size };
+      })();
+  const downscale = Math.min(1, 960 / Math.max(source.width, source.height, 1));
+  canvas.width = Math.max(1, Math.round(source.width * downscale));
+  canvas.height = Math.max(1, Math.round(source.height * downscale));
+  return {
+    canvas,
+    sourceX: source.x,
+    sourceY: source.y,
+    sourceWidth: source.width,
+    sourceHeight: source.height,
+  };
+}
+
+export function isPartiallyOutOfCrop(points: Array<{ x: number; y: number }>) {
+  if (!points.length) return true;
+  const tolerance = RESEARCH_PROTOCOL.cropBoundaryTolerance;
+  const outliers = points.filter((point) => (
+    point.x < -tolerance || point.x > 1 + tolerance || point.y < -tolerance || point.y > 1 + tolerance
+  )).length;
+  return outliers / points.length > RESEARCH_PROTOCOL.maximumCropBoundaryOutlierFraction;
+}
+
+export function minimumFaceSizeForFrame(width: number, height: number) {
+  const relativeSize = Math.min(width, height) * RESEARCH_PROTOCOL.minimumFaceFrameRatio;
+  return clamp(relativeSize, RESEARCH_PROTOCOL.minimumFacePixelsFloor, RESEARCH_PROTOCOL.minimumFacePixelsCeiling);
 }
 
 function emptyObservation(reason: string): FaceObservation {

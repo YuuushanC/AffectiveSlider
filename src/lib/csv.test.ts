@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { buildCsv, buildQaReport, createTimeline, reconstructCausalLabels, smoothLabels } from "./csv";
+import { buildCsv, buildFeatureQaReport, buildQaReport, createTimeline, reconstructCausalLabels, smoothLabels } from "./csv";
 import { LANDMARK_COUNT } from "./facePipeline";
 import { buildExportBundle } from "./exportBundle";
 import { strFromU8, unzipSync } from "fflate";
@@ -47,6 +47,8 @@ describe("canonical 10 Hz dataset", () => {
     expect(qa.passed).toBe(false);
     expect(qa.missingLabelSamples).toEqual([0, 1, 2]);
     expect(qa.missingFaceSamples).toEqual([0, 1, 2]);
+    expect(qa.invalidReasonCounts).toMatchObject({ face_not_detected: 3, invalid_source_timestamp: 3 });
+    expect(qa.invalidReasonCounts.identity_roi_mismatch).toBeUndefined();
   });
 
   it("passes complete data and rejects duplicate keys", () => {
@@ -67,6 +69,23 @@ describe("canonical 10 Hz dataset", () => {
     const samples = [...createTimeline(0, 0.9).values()].map(complete);
     samples[0] = { ...samples[0], identityMatch: false, qualityFlags: ["identity_roi_mismatch"] };
     expect(buildQaReport(samples, metadata).invalidIdentitySamples).toEqual([0]);
+  });
+
+  it("reports feature QA before annotation with reason counts and time segments", () => {
+    const samples = [...createTimeline(0, 0.9).values()].map(complete);
+    for (const index of [2, 3]) samples[index] = { ...samples[index], qualityFlags: ["partially_out_of_crop"] };
+    const qa = buildFeatureQaReport(samples);
+    expect(qa.passed).toBe(false);
+    expect(qa.validFaceRate).toBe(0.8);
+    expect(qa.invalidReasonCounts.partially_out_of_crop).toBe(2);
+    expect(qa.invalidFaceSegments).toEqual([{
+      startSampleIndex: 2,
+      endSampleIndex: 3,
+      startTimeSec: 0.2,
+      endTimeSec: 0.3,
+      sampleCount: 2,
+      reasons: ["partially_out_of_crop"],
+    }]);
   });
 
   it("rejects non-finite or temporally misaligned features", () => {
@@ -130,6 +149,13 @@ describe("canonical 10 Hz dataset", () => {
     const bundle = await buildExportBundle(samples, metadata, [], qa);
     const files = unzipSync(new Uint8Array(await bundle.blob.arrayBuffer()));
     expect(Object.keys(files).sort()).toEqual(["manifest.json", "metadata_qa.json"]);
+    const metadataQa = JSON.parse(strFromU8(files["metadata_qa.json"]));
+    expect(metadataQa.qa.invalidReasonCounts.face_not_detected).toBe(10);
+    expect(metadataQa.qa.invalidFaceSegments[0]).toMatchObject({
+      startSampleIndex: 0,
+      endSampleIndex: 9,
+      sampleCount: 10,
+    });
     expect(bundle.filename).toContain("qa-failed");
   });
 });

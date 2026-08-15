@@ -1,4 +1,5 @@
 import type { AnnotationSample, AuditEvent, Mode, Rect, Step } from "../types";
+import { PROCESSING_VERSION } from "../version";
 
 const DATABASE_NAME = "affective-slider-local";
 const STORE_NAME = "drafts";
@@ -6,7 +7,8 @@ const DRAFT_KEY = "active-session";
 const DATABASE_VERSION = 1;
 
 export interface SessionDraft {
-  draftVersion: 1;
+  draftVersion: 2;
+  processingVersion: string;
   savedAt: string;
   videoFingerprint: string;
   videoDurationSec: number;
@@ -47,9 +49,9 @@ export async function saveDraft(draft: SessionDraft) {
 
 export async function loadDraft(): Promise<SessionDraft | null> {
   const database = await openDatabase();
-  const result = await requestToPromise<SessionDraft | undefined>(database.transaction(STORE_NAME, "readonly").objectStore(STORE_NAME).get(DRAFT_KEY));
+  const result = await requestToPromise<StoredDraft | undefined>(database.transaction(STORE_NAME, "readonly").objectStore(STORE_NAME).get(DRAFT_KEY));
   database.close();
-  return result?.draftVersion === 1 ? result : null;
+  return result ? normalizeDraft(result) : null;
 }
 
 export async function clearDraft() {
@@ -74,4 +76,37 @@ function requestToPromise<T = IDBValidKey>(request: IDBRequest<T>) {
     request.onsuccess = () => resolve(request.result);
     request.onerror = () => reject(request.error ?? new Error("本機暫存失敗"));
   });
+}
+
+type LegacySessionDraft = Omit<SessionDraft, "draftVersion" | "processingVersion"> & {
+  draftVersion: 1;
+  processingVersion?: never;
+};
+
+type StoredDraft = SessionDraft | LegacySessionDraft;
+
+export function normalizeDraft(draft: StoredDraft): SessionDraft {
+  if (draft.draftVersion === 2 && draft.processingVersion === PROCESSING_VERSION) return draft;
+  return {
+    ...draft,
+    draftVersion: 2,
+    processingVersion: PROCESSING_VERSION,
+    step: "roi",
+    samples: [],
+    mode: null,
+    valenceDone: false,
+    arousalDone: false,
+    currentTime: draft.clipStart,
+    labelTrajectories: { valence: [], arousal: [] },
+    auditEvents: [
+      ...draft.auditEvents,
+      {
+        event: "seek",
+        mediaTime: draft.clipStart,
+        recordedAt: new Date().toISOString(),
+        mode: null,
+        detail: "draft_processing_version_changed_reextract_required",
+      },
+    ],
+  };
 }

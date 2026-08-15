@@ -17,14 +17,15 @@ import { Badge } from "./components/ui/badge";
 import { Button } from "./components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "./components/ui/card";
 import { Slider } from "./components/ui/slider";
-import { buildQaReport, createTimeline, reconstructCausalLabels } from "./lib/csv";
+import { buildFeatureQaReport, buildQaReport, createTimeline, invalidFaceReasons, reconstructCausalLabels } from "./lib/csv";
 import { readClientEnvironment, readCompatibilityIssues } from "./lib/clientEnvironment";
 import { clearDraft, fingerprintVideo, loadDraft, saveDraft, type SessionDraft } from "./lib/draftStore";
 import { buildExportBundle, downloadBlob } from "./lib/exportBundle";
 import { clampRect, createFaceLandmarker, detectFace, LANDMARK_MODEL_VERSION } from "./lib/facePipeline";
-import { advanceTrackingRoi, trackedRoiForTime } from "./lib/tracking";
+import { advanceTrackingRoi, faceSearchPlan, trackedRoiForTime } from "./lib/tracking";
 import { RESEARCH_PROTOCOL } from "./protocol";
-import type { AnnotationSample, AuditEvent, Mode, Rect, SessionMetadata, Step } from "./types";
+import type { AnnotationSample, AuditEvent, FeatureQaReport, Mode, Rect, SessionMetadata, Step } from "./types";
+import { PROCESSING_VERSION, SCHEMA_VERSION, TOOL_VERSION } from "./version";
 
 const FPS = RESEARCH_PROTOCOL.samplingHz;
 const round2 = (value: number) => Number(value.toFixed(2));
@@ -63,6 +64,7 @@ export function App() {
   const [valenceDone, setValenceDone] = useState(false);
   const [arousalDone, setArousalDone] = useState(false);
   const [samples, setSamples] = useState<Map<number, AnnotationSample>>(new Map());
+  const [featureQa, setFeatureQa] = useState<FeatureQaReport | null>(null);
   const [isPlaying, setIsPlaying] = useState(false);
   const [currentTime, setCurrentTime] = useState(0);
   const [isExportOpen, setIsExportOpen] = useState(false);
@@ -92,6 +94,7 @@ export function App() {
   }));
 
   const canExport = valenceDone && arousalDone && samples.size > 0;
+  const annotationBlocked = featureQa !== null && !featureQa.passed;
   const progress = duration ? ((currentTime - clipStart) / Math.max(0.1, clipEnd - clipStart)) * 100 : 0;
   const sortedSamples = useMemo(() => [...samples.values()].sort((a, b) => a.sampleIndex - b.sampleIndex), [samples]);
   const compatibilityIssues = useMemo(() => readCompatibilityIssues(), []);
@@ -145,7 +148,8 @@ export function App() {
     if (!videoFile || duration <= 0 || exportSuccess) return;
     const timeout = window.setTimeout(() => {
       const draft: SessionDraft = {
-        draftVersion: 1,
+        draftVersion: 2,
+        processingVersion: PROCESSING_VERSION,
         savedAt: new Date().toISOString(),
         videoFingerprint: fingerprintVideo(videoFile),
         videoDurationSec: duration,
@@ -239,6 +243,7 @@ export function App() {
     setStep("clip");
     setRoi(null);
     setSamples(new Map());
+    setFeatureQa(null);
     setValenceDone(false);
     setArousalDone(false);
     setMode(null);
@@ -264,6 +269,7 @@ export function App() {
       setStep(draft.step);
       setRoi(draft.roi);
       setSamples(new Map(draft.samples.map((sample) => [sample.sampleIndex, sample])));
+      setFeatureQa(draft.samples.length ? buildFeatureQaReport(draft.samples) : null);
       setMode(draft.mode);
       modeRef.current = draft.mode;
       setValence(draft.valence);
@@ -283,7 +289,10 @@ export function App() {
       const restoredTime = Math.min(Math.max(draft.currentTime, draft.clipStart), draft.clipEnd);
       video.currentTime = restoredTime;
       setCurrentTime(restoredTime);
-      setDraftStatus(`已恢復 ${new Date(draft.savedAt).toLocaleString("zh-TW")} 的本機暫存`);
+      const requiresReextraction = draft.auditEvents.some((event) => event.detail === "draft_processing_version_changed_reextract_required");
+      setDraftStatus(requiresReextraction
+        ? "追蹤版本已更新：已保留剪輯、ROI 與表單設定，請重新提取特徵後再標註。"
+        : `已恢復 ${new Date(draft.savedAt).toLocaleString("zh-TW")} 的本機暫存`);
       setRecoverableDraft(null);
       restoreCandidateRef.current = null;
       return;
@@ -388,9 +397,12 @@ export function App() {
     setIsExtracting(true);
     setExtractionProgress(0);
     setExtractionError("");
+    setFeatureQa(null);
     extractionTrackedRoiRef.current = null;
     setValenceDone(false);
     setArousalDone(false);
+    setMode(null);
+    modeRef.current = null;
     labelTrajectoryRef.current = { valence: [], arousal: [] };
     try {
       // A new detector guarantees that VIDEO tracking state never crosses videos or seeks.
@@ -399,39 +411,49 @@ export function App() {
       landmarkerRef.current = detector;
       const timeline = createTimeline(clipStart, clipEnd, FPS);
       let trackingRoi = selectedRoi;
+      let consecutiveMisses = 0;
       for (const [sampleIndex, sample] of timeline) {
         if (extractionCancelledRef.current) return;
         const decodedFrame = await seekToDecodedFrame(video, sample.targetTime);
-        const observation = detectFace(detector, video, sampleIndex * (1000 / FPS), trackingRoi);
-        if (observation.detected && observation.identityMatch && observation.roi) {
+        const searchPlan = faceSearchPlan(consecutiveMisses);
+        const observation = detectFace(detector, video, sampleIndex * (1000 / FPS), trackingRoi, searchPlan);
+        const trackFound = observation.detected && observation.identityMatch && observation.roi !== null;
+        if (trackFound && observation.roi) {
+          if (consecutiveMisses > 0) {
+            eventsRef.current.push({
+              event: "track_reacquired",
+              mediaTime: sample.targetTime,
+              recordedAt: new Date().toISOString(),
+              mode: null,
+              detail: `sample_index=${sampleIndex};after_misses=${consecutiveMisses};search=${searchPlan.mode}`,
+            });
+          }
           extractionTrackedRoiRef.current = observation.roi;
           trackingRoi = advanceTrackingRoi(trackingRoi, observation.roi, video.videoWidth, video.videoHeight);
+          consecutiveMisses = 0;
         } else {
           // A missing frame remains visibly and analytically missing; never draw a stale face box.
           extractionTrackedRoiRef.current = null;
+          consecutiveMisses += 1;
         }
-        timeline.set(sampleIndex, {
+        const extractedSample: AnnotationSample = {
           ...sample,
           sourceTimestamp: decodedFrame.mediaTime,
           faceDetected: observation.detected,
           identityMatch: observation.identityMatch,
           roiOverlap: observation.roiOverlap,
           qualityFlags: [...observation.qualityFlags, "model_confidence_not_exposed", decodedFrame.timestampSource],
-          exclusionReason: !observation.detected
-            ? "face_not_detected"
-            : !observation.identityMatch ? "identity_roi_mismatch" : null,
+          exclusionReason: null,
           roi: observation.roi,
           landmarks: observation.landmarks,
           normalizedLandmarks: observation.normalizedLandmarks,
           headPose: observation.headPose,
           geometry: observation.geometry,
           blendshapes: observation.blendshapes,
-        });
-        const droppedReasons = [
-          decodedFrame.timestampSource === "source_timestamp_current_time_fallback" ? "unmeasured_source_timestamp" : null,
-          !observation.detected ? "face_not_detected" : null,
-          observation.detected && !observation.identityMatch ? "identity_roi_mismatch" : null,
-        ].filter((reason): reason is string => reason !== null);
+        };
+        const droppedReasons = invalidFaceReasons(extractedSample);
+        extractedSample.exclusionReason = droppedReasons[0] ?? null;
+        timeline.set(sampleIndex, extractedSample);
         if (droppedReasons.length) {
           eventsRef.current.push({
             event: "dropped_sample",
@@ -447,7 +469,9 @@ export function App() {
         }
       }
       if (extractionCancelledRef.current) return;
+      const extractedFeatureQa = buildFeatureQaReport([...timeline.values()]);
       setSamples(timeline);
+      setFeatureQa(extractedFeatureQa);
       video.currentTime = clipStart;
       setCurrentTime(clipStart);
       setStep("annotate");
@@ -469,6 +493,14 @@ export function App() {
     setIsPlaying(true);
   };
 
+  const reviewFeatureSegment = (time: number) => {
+    pause();
+    const video = videoRef.current;
+    if (!video) return;
+    video.currentTime = Math.min(Math.max(time, clipStart), clipEnd);
+    setCurrentTime(video.currentTime);
+  };
+
   const pause = () => {
     if (videoRef.current && !videoRef.current.paused) logEvent("pause", videoRef.current.currentTime);
     videoRef.current?.pause();
@@ -476,6 +508,10 @@ export function App() {
   };
 
   const selectMode = (nextMode: "valence" | "arousal") => {
+    if (annotationBlocked) {
+      setAnnotationError("特徵 QA 未通過，請先修改剪輯範圍或重新框選臉部後再提取。");
+      return;
+    }
     pause();
     setAnnotationError("");
     setMode(nextMode);
@@ -566,8 +602,8 @@ export function App() {
       annotationDelaySec: RESEARCH_PROTOCOL.annotationDelaySec,
       smoothingWindowSec: RESEARCH_PROTOCOL.smoothingWindowSec,
       annotatedAt: new Date().toISOString(),
-      toolVersion: "0.4.3", landmarkModelVersion: LANDMARK_MODEL_VERSION,
-      schemaVersion: "2.2.0", processingVersion: "roi-dynamic-track-10hz-v3",
+      toolVersion: TOOL_VERSION, landmarkModelVersion: LANDMARK_MODEL_VERSION,
+      schemaVersion: SCHEMA_VERSION, processingVersion: PROCESSING_VERSION,
       protocolVersion: RESEARCH_PROTOCOL.protocolVersion,
       targetConstruct: RESEARCH_PROTOCOL.targetConstruct,
       ...client,
@@ -602,6 +638,7 @@ export function App() {
     setStep("clip");
     setRoi(null);
     setSamples(new Map());
+    setFeatureQa(null);
     setValenceDone(false);
     setArousalDone(false);
     setMode(null);
@@ -644,6 +681,7 @@ export function App() {
     const next = Math.min(value, clipEnd - 0.2);
     setClipStart(round2(next));
     setSamples(new Map());
+    setFeatureQa(null);
     setValenceDone(false);
     setArousalDone(false);
     if (videoRef.current) videoRef.current.currentTime = next;
@@ -654,6 +692,7 @@ export function App() {
     const next = Math.max(value, clipStart + 0.2);
     setClipEnd(round2(next));
     setSamples(new Map());
+    setFeatureQa(null);
     setValenceDone(false);
     setArousalDone(false);
     if (videoRef.current) videoRef.current.currentTime = next;
@@ -755,7 +794,7 @@ export function App() {
                 {step === "clip" ? "影片剪輯" : step === "roi" ? "臉部位置標註" : mode === "arousal" ? "喚醒度標註" : "愉悅度標註"}
               </CardTitle>
               <p className="panel-description">
-                {step === "clip" ? "先設定影片起訖點，畫面遮罩會標示捨棄片段。" : step === "roi" ? "框選第一幀臉部作為身份錨點；提取後實線框會逐幀跟隨臉部。" : "分兩階段錄製愉悅度與喚醒度；綠色實線框顯示每個 10 Hz 樣本的實際偵測位置。"}
+                {step === "clip" ? "先設定影片起訖點，畫面遮罩會標示捨棄片段。" : step === "roi" ? "框住完整臉部並在四周保留空間；工具會自動擴大搜尋並在失去追蹤後重新鎖定。" : annotationBlocked ? "特徵 QA 未通過；V/A 已暫時鎖定，請先檢查問題片段。" : "分兩階段錄製愉悅度與喚醒度；綠色實線框顯示每個 10 Hz 樣本的實際偵測位置。"}
               </p>
             </CardHeader>
             <CardContent className="control-content">
@@ -775,7 +814,7 @@ export function App() {
                     <SquareDashedMousePointer size={22} />
                     <div>
                       <strong>{roi && roi.size >= 24 ? "身份錨點已選取" : "等待框選臉部"}</strong>
-                      <span>{roi ? `${Math.round(roi.size)} x ${Math.round(roi.size)} px；虛線只標示起始位置` : "請在左側影片上拖曳出正方形範圍"}</span>
+                      <span>{roi ? `${Math.round(roi.size)} x ${Math.round(roi.size)} px；請確認包含完整臉部及四周約 20–30% 空間` : "請在左側影片上拖曳出包含完整臉部的正方形範圍"}</span>
                     </div>
                   </div>
                   <div className="two-actions">
@@ -787,7 +826,7 @@ export function App() {
                     </Button>
                   </div>
                   <p className={modelStatus === "error" ? "dialog-error" : "panel-description"}>
-                    {browserIncompatible ? "瀏覽器相容性檢查未通過，無法開始正式標註" : isExtracting ? "正在以移動追蹤視窗依固定 10 Hz 時間點預先提取；完成後特徵將鎖定。" : modelStatus === "ready" ? "真實臉部特徵模型已就緒" : modelStatus === "error" ? "臉部特徵模型載入失敗，無法開始正式標註" : "正在載入臉部特徵模型…"}
+                    {browserIncompatible ? "瀏覽器相容性檢查未通過，無法開始正式標註" : isExtracting ? "正在依固定 10 Hz 提取；遺失追蹤時會逐級擴大到全畫面搜尋。" : modelStatus === "ready" ? "真實臉部特徵模型已就緒" : modelStatus === "error" ? "臉部特徵模型載入失敗，無法開始正式標註" : "正在載入臉部特徵模型…"}
                   </p>
                   {extractionError ? <p className="dialog-error">{extractionError}</p> : null}
                 </div>
@@ -795,17 +834,18 @@ export function App() {
 
               {step === "annotate" ? (
                 <div className="control-stack">
+                  {featureQa ? <FeatureQaCard report={featureQa} onReview={reviewFeatureSegment} /> : null}
                   <div className="mode-tabs">
-                    <Button variant={mode === "valence" ? "default" : "outline"} onClick={() => selectMode("valence")}>
+                    <Button disabled={annotationBlocked} variant={mode === "valence" ? "default" : "outline"} onClick={() => selectMode("valence")}>
                       標註愉悅度
                     </Button>
-                    <Button variant={mode === "arousal" ? "default" : "outline"} onClick={() => selectMode("arousal")}>
+                    <Button disabled={annotationBlocked} variant={mode === "arousal" ? "default" : "outline"} onClick={() => selectMode("arousal")}>
                       標註喚醒度
                     </Button>
                   </div>
 
-                  <AffectiveControl label="愉悅度 Valence" low="UNPLEASANT" high="PLEASANT" value={valence} disabled={mode !== "valence"} onChange={(next) => { valenceRef.current = next; setValence(next); recordLabel("valence", next); }} />
-                  <AffectiveControl label="喚醒度 Arousal" low="CALM" high="EXCITED" value={arousal} disabled={mode !== "arousal"} onChange={(next) => { arousalRef.current = next; setArousal(next); recordLabel("arousal", next); }} />
+                  <AffectiveControl label="愉悅度 Valence" low="UNPLEASANT" high="PLEASANT" value={valence} disabled={annotationBlocked || mode !== "valence"} onChange={(next) => { valenceRef.current = next; setValence(next); recordLabel("valence", next); }} />
+                  <AffectiveControl label="喚醒度 Arousal" low="CALM" high="EXCITED" value={arousal} disabled={annotationBlocked || mode !== "arousal"} onChange={(next) => { arousalRef.current = next; setArousal(next); recordLabel("arousal", next); }} />
 
                   <div className="three-actions">
                     <Button variant="secondary" onClick={isPlaying ? pause : playClip} disabled={!mode || tabletPortrait}>
@@ -814,7 +854,7 @@ export function App() {
                     <Button variant="outline" onClick={finishMode} disabled={!mode}>
                       <Check size={18} /> 完成
                     </Button>
-                    <Button variant="outline" onClick={() => { pause(); setStep("roi"); setRoi(null); }}>
+                    <Button variant="outline" onClick={() => { pause(); setStep("roi"); setRoi(null); setFeatureQa(null); }}>
                       <RotateCcw size={18} /> 重標
                     </Button>
                   </div>
@@ -924,6 +964,47 @@ export function App() {
         </div>
       ) : null}
     </main>
+  );
+}
+
+const FACE_REASON_LABELS: Record<string, string> = {
+  face_not_detected: "未偵測到臉",
+  identity_roi_mismatch: "身份／追蹤位置不符",
+  partially_out_of_crop: "臉部超出搜尋範圍",
+  face_too_small: "臉部尺寸太小",
+  non_finite_landmarks: "landmark 數值異常",
+  landmark_count_mismatch: "landmark 點數異常",
+  invalid_source_timestamp: "來源影格時間無效",
+};
+
+function FeatureQaCard({ report, onReview }: { report: FeatureQaReport; onReview: (time: number) => void }) {
+  const percent = (report.validFaceRate * 100).toFixed(1);
+  return (
+    <section className={`feature-qa ${report.passed ? "is-passed" : "is-failed"}`} aria-live="polite">
+      <div className="feature-qa-heading">
+        {report.passed ? <Check size={20} /> : <AlertTriangle size={20} />}
+        <div>
+          <strong>{report.passed ? `特徵 QA 通過｜${percent}%` : `特徵 QA 未通過｜${percent}%`}</strong>
+          <span>{report.validFaceCount} / {report.sampleCount} 個 10 Hz 樣本有效</span>
+        </div>
+      </div>
+      {!report.passed ? (
+        <p>V/A 標註已鎖定。請點選問題區段檢查，再修改剪輯或重新框選臉部。</p>
+      ) : null}
+      {report.invalidFaceSegments.length ? (
+        <div className="feature-qa-segments">
+          {report.invalidFaceSegments.slice(0, 4).map((segment) => (
+            <button key={`${segment.startSampleIndex}-${segment.endSampleIndex}`} type="button" onClick={() => onReview(segment.startTimeSec)}>
+              <span>{formatTime(segment.startTimeSec)}–{formatTime(segment.endTimeSec)}</span>
+              <small>{segment.sampleCount} 筆｜{segment.reasons.map((reason) => FACE_REASON_LABELS[reason] ?? reason).join("、")}</small>
+            </button>
+          ))}
+          {report.invalidFaceSegments.length > 4 ? <small>另有 {report.invalidFaceSegments.length - 4} 個問題區段，完整明細會保存在 QA 報告。</small> : null}
+        </div>
+      ) : (
+        <p>所有樣本皆有有效的目標臉部特徵。</p>
+      )}
+    </section>
   );
 }
 

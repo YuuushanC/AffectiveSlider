@@ -42,8 +42,8 @@ npm run build
 ## 標註流程
 
 1. 上傳 MP4 並設定研究片段起訖點。
-2. 框選受試者第一幀臉部作為身份錨點；工具會以此初始化移動搜尋視窗，逐幀跟隨受試者並降低選到刺激影片人物的風險。虛線框是起始錨點，提取與標註階段的實線框才是每個 10 Hz 樣本的實際偵測位置。
-3. 工具依固定 10 Hz canonical timestamps seek、解碼並完成一次特徵提取，隨後鎖定特徵。
+2. 框選受試者第一幀完整臉部並保留約 20–30% 空間作為身份錨點；工具會以此初始化移動搜尋視窗，遺失追蹤時依序擴大範圍並在連續三個樣本失敗後使用全畫面重新鎖定。虛線框是起始錨點，提取與標註階段的實線框才是每個 10 Hz 樣本的實際偵測位置。
+3. 工具依固定 10 Hz canonical timestamps seek、解碼並完成一次特徵提取，接著立即顯示特徵 QA。未達 95% 或特徵無時間變異時會鎖定 V/A 標註，避免完成兩輪標註後才發現臉部特徵不可用。
 4. 分兩次播放標註 Valence 與 Arousal。滑桿事件以 causal zero-order hold 對齊同一組 `sample_index`，不使用未來值回填。
 5. 填寫匿名 participant/session/stimulus/trial 資訊並執行 QA。
 6. QA 未通過時，ZIP 只含報告與拒絕原因；通過時才包含 `dataset.csv`。
@@ -56,12 +56,14 @@ npm run build
 通過 QA 的 ZIP 包含：
 
 - `dataset.csv`：固定 0.1 秒一列的標籤、品質、478 點真實／正規化 landmark、頭部姿態、幾何量與 52 個 blendshape。
-- `metadata_qa.json`：匿名 session 條件、clip 範圍、工具／模型／protocol 版本、粗略瀏覽器環境、audit events 與完整 QA。
+- `metadata_qa.json`：匿名 session 條件、clip 範圍、工具／模型／protocol 版本、粗略瀏覽器環境、重新鎖定事件、各失敗原因計數、問題時間區段與完整 QA。
 - `manifest.json`：每個檔案的 byte 數與 SHA-256 checksum。
 
 輸出不保存原始影片檔名，只保存匿名影片 ID、影片長度與檔案大小。MediaPipe Web API 不公開逐幀偵測／追蹤信心，因此欄位維持空值並標記 `model_confidence_not_exposed`。瀏覽器也沒有可靠的容器原始 frame index，`source_frame_index` 維持空值；不可用播放累計幀冒充。
 
 標註延遲、平滑視窗與 QA 門檻集中在 `src/protocol.ts`。先導研究決定延遲後必須更新 protocol version，不可逐參與者或逐 fold 修改。
+
+版本 0.5 起使用解析度相對的臉部大小門檻，並只在超過容許比例的 landmark 明顯越界時標記 `partially_out_of_crop`。處理版本更新後，舊本機暫存會保留剪輯、ROI 與表單，但強制重新提取特徵，避免把舊演算法結果標成新版本。
 
 ## LOSO 1D CNN-LSTM
 

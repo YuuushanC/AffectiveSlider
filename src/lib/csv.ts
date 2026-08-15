@@ -1,6 +1,8 @@
 import { BLENDSHAPE_NAMES, LANDMARK_COUNT } from "./facePipeline";
 import { RESEARCH_PROTOCOL } from "../protocol";
-import type { AnnotationSample, AuditEvent, QaReport, SessionMetadata } from "../types";
+import type { AnnotationSample, AuditEvent, FeatureQaReport, InvalidFaceSegment, QaReport, SessionMetadata } from "../types";
+
+const FATAL_FACE_FLAGS = ["identity_roi_mismatch", "partially_out_of_crop", "face_too_small", "non_finite_landmarks"] as const;
 
 const GEOMETRY_HEADERS = [
   "face_width", "eye_distance", "left_eye_open", "right_eye_open",
@@ -72,6 +74,57 @@ export function reconstructCausalLabels(
   });
 }
 
+export function invalidFaceReasons(sample: AnnotationSample) {
+  const reasons: string[] = [];
+  if (!sample.faceDetected) {
+    reasons.push("face_not_detected");
+  } else {
+    if (!sample.identityMatch) reasons.push("identity_roi_mismatch");
+    for (const flag of FATAL_FACE_FLAGS) {
+      if (sample.qualityFlags.includes(flag)) reasons.push(flag);
+    }
+    if (sample.landmarks.length !== LANDMARK_COUNT || sample.normalizedLandmarks.length !== LANDMARK_COUNT) {
+      reasons.push("landmark_count_mismatch");
+    }
+    if (!allPointsFinite(sample.landmarks) || !allPointsFinite(sample.normalizedLandmarks)) {
+      reasons.push("non_finite_landmarks");
+    }
+  }
+  const sourceTimestampIsMeasured = !sample.qualityFlags.includes("source_timestamp_current_time_fallback");
+  if (!sourceTimestampIsMeasured || sample.sourceTimestamp === null
+    || Math.abs(sample.sourceTimestamp - sample.targetTime) > RESEARCH_PROTOCOL.maximumSourceTimeErrorSec) {
+    reasons.push("invalid_source_timestamp");
+  }
+  return [...new Set(reasons)];
+}
+
+export function buildFeatureQaReport(samples: AnnotationSample[]): FeatureQaReport {
+  const invalid = samples
+    .map((sample) => ({ sample, reasons: invalidFaceReasons(sample) }))
+    .filter(({ reasons }) => reasons.length > 0);
+  const validSamples = samples.filter((sample) => invalidFaceReasons(sample).length === 0);
+  const validFeatureVectors = validSamples.map((sample) => (
+    sample.normalizedLandmarks.flatMap((point) => [point.x, point.y, point.z ?? 0])
+  ));
+  const validFaceRate = validSamples.length / Math.max(1, samples.length);
+  const featureVariation = meanConsecutiveVariation(validFeatureVectors);
+  const rejectionReasons: string[] = [];
+  if (validFaceRate < RESEARCH_PROTOCOL.minimumValidFaceRate) rejectionReasons.push("目標受試者有效臉部特徵率低於 95%");
+  if (validFeatureVectors.length < 2) rejectionReasons.push("有效臉部特徵不足以檢查時間變異");
+  else if (featureVariation < 1e-5) rejectionReasons.push("正規化臉部特徵缺乏時間變異");
+  return {
+    passed: rejectionReasons.length === 0,
+    sampleCount: samples.length,
+    validFaceCount: validSamples.length,
+    invalidFaceCount: invalid.length,
+    validFaceRate,
+    featureVariation,
+    invalidReasonCounts: countInvalidReasons(invalid),
+    invalidFaceSegments: buildInvalidFaceSegments(invalid),
+    rejectionReasons,
+  };
+}
+
 export function buildQaReport(samples: AnnotationSample[], metadata: SessionMetadata): QaReport {
   const expectedCount = Math.floor((metadata.clipEndSec - metadata.clipStartSec) * metadata.samplingHz) + 1;
   const seen = new Set<number>();
@@ -93,6 +146,7 @@ export function buildQaReport(samples: AnnotationSample[], metadata: SessionMeta
   );
   let validProcessedLabels = 0;
   const validFeatureVectors: number[][] = [];
+  const invalidFaceDetails: Array<{ sample: AnnotationSample; reasons: string[] }> = [];
   for (let index = 0; index < samples.length; index += 1) {
     const sample = samples[index];
     if (seen.has(sample.sampleIndex)) duplicates.push(sample.sampleIndex);
@@ -105,17 +159,13 @@ export function buildQaReport(samples: AnnotationSample[], metadata: SessionMeta
     if (sample.valenceRaw === null || sample.arousalRaw === null || Math.abs(sample.valenceRaw) > 1 || Math.abs(sample.arousalRaw) > 1) missingLabel.push(sample.sampleIndex);
     else validLabels += 1;
     if (smoothed[index]?.valenceSmoothed !== null && smoothed[index]?.arousalSmoothed !== null) validProcessedLabels += 1;
-    const finite = allPointsFinite(sample.landmarks) && allPointsFinite(sample.normalizedLandmarks);
-    const sourceTimestampIsMeasured = !sample.qualityFlags.includes("source_timestamp_current_time_fallback");
-    const sourceTimeValid = sourceTimestampIsMeasured && sample.sourceTimestamp !== null
-      && Math.abs(sample.sourceTimestamp - sample.targetTime) <= RESEARCH_PROTOCOL.maximumSourceTimeErrorSec;
-    if (!sample.identityMatch) invalidIdentity.push(sample.sampleIndex);
-    if (!sourceTimeValid) invalidSourceTime.push(sample.sampleIndex);
-    if (!finite) nonFiniteFeature.push(sample.sampleIndex);
-    const fatalFlag = sample.qualityFlags.some((flag) => ["identity_roi_mismatch", "partially_out_of_crop", "face_too_small", "non_finite_landmarks"].includes(flag));
-    const validFace = sample.faceDetected && sample.identityMatch && sourceTimeValid && finite
-      && sample.landmarks.length === LANDMARK_COUNT && sample.normalizedLandmarks.length === LANDMARK_COUNT && !fatalFlag;
+    const invalidReasons = invalidFaceReasons(sample);
+    if (invalidReasons.includes("identity_roi_mismatch")) invalidIdentity.push(sample.sampleIndex);
+    if (invalidReasons.includes("invalid_source_timestamp")) invalidSourceTime.push(sample.sampleIndex);
+    if (invalidReasons.includes("non_finite_landmarks") || invalidReasons.includes("landmark_count_mismatch")) nonFiniteFeature.push(sample.sampleIndex);
+    const validFace = invalidReasons.length === 0;
     if (!validFace) missingFace.push(sample.sampleIndex);
+    if (!validFace) invalidFaceDetails.push({ sample, reasons: invalidReasons });
     else {
       validFaces += 1;
       validFeatureVectors.push(sample.normalizedLandmarks.flatMap((point) => [point.x, point.y, point.z ?? 0]));
@@ -163,6 +213,8 @@ export function buildQaReport(samples: AnnotationSample[], metadata: SessionMeta
     invalidIdentitySamples: invalidIdentity,
     invalidSourceTimeSamples: invalidSourceTime,
     nonFiniteFeatureSamples: nonFiniteFeature,
+    invalidReasonCounts: countInvalidReasons(invalidFaceDetails),
+    invalidFaceSegments: buildInvalidFaceSegments(invalidFaceDetails),
     constantValenceRuns,
     constantArousalRuns,
     valenceJumps,
@@ -254,6 +306,40 @@ function countConstantRuns(values: Array<number | null>, minimum = 50) {
 
 function allPointsFinite(points: AnnotationSample["landmarks"]) {
   return points.length > 0 && points.every((point) => Number.isFinite(point.x) && Number.isFinite(point.y) && Number.isFinite(point.z ?? 0));
+}
+
+function countInvalidReasons(details: Array<{ reasons: string[] }>) {
+  const counts: Record<string, number> = {};
+  for (const { reasons } of details) {
+    for (const reason of reasons) counts[reason] = (counts[reason] ?? 0) + 1;
+  }
+  return counts;
+}
+
+function buildInvalidFaceSegments(
+  details: Array<{ sample: AnnotationSample; reasons: string[] }>,
+): InvalidFaceSegment[] {
+  const ordered = [...details].sort((a, b) => a.sample.sampleIndex - b.sample.sampleIndex);
+  const segments: InvalidFaceSegment[] = [];
+  for (const detail of ordered) {
+    const last = segments.at(-1);
+    if (!last || detail.sample.sampleIndex !== last.endSampleIndex + 1) {
+      segments.push({
+        startSampleIndex: detail.sample.sampleIndex,
+        endSampleIndex: detail.sample.sampleIndex,
+        startTimeSec: detail.sample.targetTime,
+        endTimeSec: detail.sample.targetTime,
+        sampleCount: 1,
+        reasons: [...detail.reasons],
+      });
+      continue;
+    }
+    last.endSampleIndex = detail.sample.sampleIndex;
+    last.endTimeSec = detail.sample.targetTime;
+    last.sampleCount += 1;
+    last.reasons = [...new Set([...last.reasons, ...detail.reasons])];
+  }
+  return segments;
 }
 
 function meanConsecutiveVariation(vectors: number[][]) {

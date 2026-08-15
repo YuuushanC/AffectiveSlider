@@ -518,6 +518,76 @@ input[type="range"]::-webkit-slider-thumb {
   font-weight: 700;
 }
 
+.feature-qa {
+  display: grid;
+  gap: .75rem;
+  padding: 1rem;
+  border: 1px solid #a7f3d0;
+  border-radius: .75rem;
+  color: #065f46;
+  background: #ecfdf5;
+}
+
+.feature-qa.is-failed {
+  border-color: #fecaca;
+  color: #991b1b;
+  background: #fff7f7;
+}
+
+.feature-qa-heading {
+  display: flex;
+  align-items: center;
+  gap: .7rem;
+}
+
+.feature-qa-heading strong,
+.feature-qa-heading span {
+  display: block;
+}
+
+.feature-qa-heading strong {
+  font-size: .88rem;
+  font-weight: 700;
+}
+
+.feature-qa-heading span,
+.feature-qa p,
+.feature-qa-segments small {
+  font-size: .74rem;
+  line-height: 1.45;
+}
+
+.feature-qa-heading span {
+  margin-top: .12rem;
+}
+
+.feature-qa p {
+  margin: 0;
+}
+
+.feature-qa-segments {
+  display: grid;
+  gap: .45rem;
+}
+
+.feature-qa-segments button {
+  display: grid;
+  gap: .15rem;
+  min-height: 44px;
+  padding: .55rem .65rem;
+  border: 1px solid currentColor;
+  border-radius: .5rem;
+  color: inherit;
+  background: rgb(255 255 255 / .7);
+  text-align: left;
+  cursor: pointer;
+}
+
+.feature-qa-segments button > span {
+  font-size: .78rem;
+  font-weight: 700;
+}
+
 .two-actions,
 .mode-tabs,
 .completion-grid {

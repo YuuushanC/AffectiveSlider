@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { advanceTrackingRoi, isPlausibleTrack, trackedRoiForTime } from "./tracking";
+import { advanceTrackingRoi, faceSearchPlan, isPlausibleTrack, trackedRoiForTime } from "./tracking";
 import type { AnnotationSample, Rect } from "../types";
 
 const sample = (sampleIndex: number, roi: Rect | null, valid = true): AnnotationSample => ({
@@ -62,5 +62,20 @@ describe("dynamic face tracking", () => {
     expect(next.y).toBeGreaterThan(100);
     expect(next.size).toBeGreaterThan(100);
     expect(next.size).toBeLessThan(120);
+  });
+
+  it("escalates from tracked crop to full-frame reacquisition", () => {
+    expect(faceSearchPlan(0).mode).toBe("tracked");
+    expect(faceSearchPlan(1).mode).toBe("expanded");
+    expect(faceSearchPlan(2).mode).toBe("wide");
+    expect(faceSearchPlan(3)).toMatchObject({ mode: "full_frame", fullFrame: true });
+    expect(faceSearchPlan(20).mode).toBe("full_frame");
+  });
+
+  it("uses a controlled wider identity tolerance only during reacquisition", () => {
+    const previous = { x: 100, y: 100, size: 100 };
+    const moved = { x: 240, y: 100, size: 100 };
+    expect(isPlausibleTrack(previous, moved)).toBe(false);
+    expect(isPlausibleTrack(previous, moved, faceSearchPlan(2).maximumNormalizedDistance)).toBe(true);
   });
 });
