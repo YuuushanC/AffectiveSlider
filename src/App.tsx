@@ -1,5 +1,6 @@
 import { ChangeEvent, PointerEvent, useEffect, useMemo, useRef, useState } from "react";
 import {
+  AlertTriangle,
   ArrowLeft,
   BrainCircuit,
   Check,
@@ -16,11 +17,17 @@ import { Badge } from "./components/ui/badge";
 import { Button } from "./components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "./components/ui/card";
 import { Slider } from "./components/ui/slider";
-import { buildCsv, buildMetadata, buildQaReport, createTimeline, downloadText } from "./lib/csv";
+import { buildFeatureQaReport, buildQaReport, createTimeline, invalidFaceReasons, reconstructCausalLabels } from "./lib/csv";
+import { readClientEnvironment, readCompatibilityIssues } from "./lib/clientEnvironment";
+import { clearDraft, fingerprintVideo, loadDraft, saveDraft, type SessionDraft } from "./lib/draftStore";
+import { buildExportBundle, downloadBlob } from "./lib/exportBundle";
 import { clampRect, createFaceLandmarker, detectFace, LANDMARK_MODEL_VERSION } from "./lib/facePipeline";
-import type { AnnotationSample, AuditEvent, Mode, Rect, SessionMetadata, Step } from "./types";
+import { advanceTrackingRoi, faceSearchPlan, trackedRoiForTime } from "./lib/tracking";
+import { RESEARCH_PROTOCOL } from "./protocol";
+import type { AnnotationSample, AuditEvent, FeatureQaReport, Mode, Rect, SessionMetadata, Step } from "./types";
+import { PROCESSING_VERSION, SCHEMA_VERSION, TOOL_VERSION } from "./version";
 
-const FPS = 10;
+const FPS = RESEARCH_PROTOCOL.samplingHz;
 const round2 = (value: number) => Number(value.toFixed(2));
 const formatTime = (value: number) => {
   if (!Number.isFinite(value)) return "00:00.0";
@@ -35,11 +42,14 @@ export function App() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const drawRef = useRef<number | null>(null);
   const landmarkerRef = useRef<Awaited<ReturnType<typeof createFaceLandmarker>> | null>(null);
-  const lastSampleRef = useRef<Record<"valence" | "arousal", number>>({ valence: -1, arousal: -1 });
   const modeRef = useRef<Mode>(null);
   const valenceRef = useRef(0);
   const arousalRef = useRef(0);
   const eventsRef = useRef<AuditEvent[]>([]);
+  const labelTrajectoryRef = useRef<Record<"valence" | "arousal", Array<{ mediaTime: number; value: number }>>>({ valence: [], arousal: [] });
+  const extractionCancelledRef = useRef(false);
+  const restoreCandidateRef = useRef<SessionDraft | null>(null);
+  const extractionTrackedRoiRef = useRef<Rect | null>(null);
   const [videoFile, setVideoFile] = useState<File | null>(null);
   const [videoUrl, setVideoUrl] = useState("");
   const [duration, setDuration] = useState(0);
@@ -54,6 +64,7 @@ export function App() {
   const [valenceDone, setValenceDone] = useState(false);
   const [arousalDone, setArousalDone] = useState(false);
   const [samples, setSamples] = useState<Map<number, AnnotationSample>>(new Map());
+  const [featureQa, setFeatureQa] = useState<FeatureQaReport | null>(null);
   const [isPlaying, setIsPlaying] = useState(false);
   const [currentTime, setCurrentTime] = useState(0);
   const [isExportOpen, setIsExportOpen] = useState(false);
@@ -62,31 +73,126 @@ export function App() {
   const [sequenceNumber, setSequenceNumber] = useState("");
   const [exportError, setExportError] = useState("");
   const [modelStatus, setModelStatus] = useState<"loading" | "ready" | "error">("loading");
+  const [isExtracting, setIsExtracting] = useState(false);
+  const [extractionProgress, setExtractionProgress] = useState(0);
+  const [extractionError, setExtractionError] = useState("");
+  const [annotationError, setAnnotationError] = useState("");
   const [sessionId, setSessionId] = useState("");
   const [stimulusId, setStimulusId] = useState("");
   const [trialId, setTrialId] = useState("01");
   const [stimulusEmotion, setStimulusEmotion] = useState("");
   const [experimentalCondition, setExperimentalCondition] = useState("personalized_reels");
-  const [annotationDelaySec, setAnnotationDelaySec] = useState(0);
+  const [recoverableDraft, setRecoverableDraft] = useState<SessionDraft | null>(null);
+  const [draftStatus, setDraftStatus] = useState("");
+  const [draftRevision, setDraftRevision] = useState(0);
+  const [isExporting, setIsExporting] = useState(false);
+  const [exportSuccess, setExportSuccess] = useState("");
+  const [viewport, setViewport] = useState(() => ({
+    width: window.innerWidth,
+    height: window.innerHeight,
+    coarse: window.matchMedia("(pointer: coarse)").matches,
+  }));
 
   const canExport = valenceDone && arousalDone && samples.size > 0;
+  const annotationBlocked = featureQa !== null && !featureQa.passed;
   const progress = duration ? ((currentTime - clipStart) / Math.max(0.1, clipEnd - clipStart)) * 100 : 0;
   const sortedSamples = useMemo(() => [...samples.values()].sort((a, b) => a.sampleIndex - b.sampleIndex), [samples]);
+  const compatibilityIssues = useMemo(() => readCompatibilityIssues(), []);
+  const browserIncompatible = compatibilityIssues.length > 0;
   const stepIndex = step === "clip" ? 0 : step === "roi" ? 1 : 2;
   const activeLabel = mode === "valence" ? "Valence Recording" : mode === "arousal" ? "Arousal Recording" : step === "annotate" ? "Ready to Record" : step === "roi" ? "Face ROI" : "Video Trim";
+  const tabletPortrait = viewport.height > viewport.width && viewport.width <= 1200;
 
   useEffect(() => {
+    if (browserIncompatible) {
+      setModelStatus("error");
+      return;
+    }
+    let cancelled = false;
     createFaceLandmarker()
-      .then((detector) => { landmarkerRef.current = detector; setModelStatus("ready"); })
-      .catch((error) => { console.error(error); setModelStatus("error"); });
-  }, []);
+      .then((detector) => {
+        if (cancelled) detector.close();
+        else { landmarkerRef.current = detector; setModelStatus("ready"); }
+      })
+      .catch((error) => {
+        if (!cancelled) { console.error(error); setModelStatus("error"); }
+      });
+    return () => { cancelled = true; };
+  }, [browserIncompatible]);
 
   useEffect(() => { modeRef.current = mode; }, [mode]);
   useEffect(() => { valenceRef.current = valence; }, [valence]);
   useEffect(() => { arousalRef.current = arousal; }, [arousal]);
 
   useEffect(() => {
+    loadDraft()
+      .then((draft) => setRecoverableDraft(draft))
+      .catch(() => setDraftStatus("無法讀取本機暫存；請勿重新整理或關閉此頁。"));
+  }, []);
+
+  useEffect(() => {
+    const updateViewport = () => setViewport({
+      width: window.innerWidth,
+      height: window.innerHeight,
+      coarse: window.matchMedia("(pointer: coarse)").matches,
+    });
+    window.addEventListener("resize", updateViewport);
+    window.addEventListener("orientationchange", updateViewport);
     return () => {
+      window.removeEventListener("resize", updateViewport);
+      window.removeEventListener("orientationchange", updateViewport);
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!videoFile || duration <= 0 || exportSuccess) return;
+    const timeout = window.setTimeout(() => {
+      const draft: SessionDraft = {
+        draftVersion: 2,
+        processingVersion: PROCESSING_VERSION,
+        savedAt: new Date().toISOString(),
+        videoFingerprint: fingerprintVideo(videoFile),
+        videoDurationSec: duration,
+        clipStart,
+        clipEnd,
+        step,
+        roi,
+        samples: sortedSamples,
+        mode,
+        valence,
+        arousal,
+        valenceDone,
+        arousalDone,
+        currentTime: videoRef.current?.currentTime ?? currentTime,
+        labelTrajectories: labelTrajectoryRef.current,
+        auditEvents: eventsRef.current,
+        form: { gender, participantId, sequenceNumber, sessionId, stimulusId, trialId, stimulusEmotion, experimentalCondition },
+      };
+      saveDraft(draft)
+        .then(() => setDraftStatus(`已於 ${new Date().toLocaleTimeString("zh-TW", { hour: "2-digit", minute: "2-digit" })} 自動暫存（不含原始影片）`))
+        .catch(() => setDraftStatus("本機暫存失敗；請確認瀏覽器仍有足夠儲存空間。"));
+    }, 1200);
+    return () => window.clearTimeout(timeout);
+  }, [
+    videoFile, duration, clipStart, clipEnd, step, roi, samples, mode, valence, arousal,
+    valenceDone, arousalDone, gender, participantId, sequenceNumber, sessionId, stimulusId,
+    trialId, stimulusEmotion, experimentalCondition, draftRevision, exportSuccess,
+  ]);
+
+  useEffect(() => {
+    const beforeUnload = (event: BeforeUnloadEvent) => {
+      if (!videoFile || exportSuccess) return;
+      event.preventDefault();
+      event.returnValue = "";
+    };
+    window.addEventListener("beforeunload", beforeUnload);
+    return () => window.removeEventListener("beforeunload", beforeUnload);
+  }, [videoFile, exportSuccess]);
+
+  useEffect(() => {
+    return () => {
+      extractionCancelledRef.current = true;
+      landmarkerRef.current?.close();
       if (videoUrl) URL.revokeObjectURL(videoUrl);
       if (drawRef.current) cancelAnimationFrame(drawRef.current);
     };
@@ -109,12 +215,10 @@ export function App() {
     const onTime = () => {
       setCurrentTime(video.currentTime);
       if (video.currentTime >= clipEnd && clipEnd > 0) {
-        captureObservation(video);
         video.pause();
         setIsPlaying(false);
         video.currentTime = clipEnd;
-        if (mode === "valence") setValenceDone(true);
-        if (mode === "arousal") setArousalDone(true);
+        if (mode) finalizeLabels(mode);
       }
     };
     video.addEventListener("timeupdate", onTime);
@@ -128,6 +232,7 @@ export function App() {
   };
 
   const loadVideo = (file: File) => {
+    void navigator.storage?.persist?.().catch(() => false);
     if (videoUrl) URL.revokeObjectURL(videoUrl);
     const url = URL.createObjectURL(file);
     setVideoFile(file);
@@ -138,18 +243,61 @@ export function App() {
     setStep("clip");
     setRoi(null);
     setSamples(new Map());
+    setFeatureQa(null);
     setValenceDone(false);
     setArousalDone(false);
     setMode(null);
     setCurrentTime(0);
     eventsRef.current = [];
-    lastSampleRef.current = { valence: -1, arousal: -1 };
+    labelTrajectoryRef.current = { valence: [], arousal: [] };
+    extractionCancelledRef.current = true;
+    restoreCandidateRef.current = recoverableDraft?.videoFingerprint === fingerprintVideo(file) ? recoverableDraft : null;
+    setExportSuccess("");
+    if (recoverableDraft && !restoreCandidateRef.current) {
+      setDraftStatus("選取的影片與未完成暫存不符，已開始新的 session；原暫存尚未刪除。");
+    }
   };
 
   const onLoadedMetadata = () => {
     const video = videoRef.current;
     if (!video) return;
     setDuration(video.duration);
+    const draft = restoreCandidateRef.current;
+    if (draft && Math.abs(draft.videoDurationSec - video.duration) <= 0.1) {
+      setClipStart(draft.clipStart);
+      setClipEnd(draft.clipEnd);
+      setStep(draft.step);
+      setRoi(draft.roi);
+      setSamples(new Map(draft.samples.map((sample) => [sample.sampleIndex, sample])));
+      setFeatureQa(draft.samples.length ? buildFeatureQaReport(draft.samples) : null);
+      setMode(draft.mode);
+      modeRef.current = draft.mode;
+      setValence(draft.valence);
+      setArousal(draft.arousal);
+      setValenceDone(draft.valenceDone);
+      setArousalDone(draft.arousalDone);
+      labelTrajectoryRef.current = draft.labelTrajectories;
+      eventsRef.current = draft.auditEvents;
+      setGender(draft.form.gender);
+      setParticipantId(draft.form.participantId);
+      setSequenceNumber(draft.form.sequenceNumber);
+      setSessionId(draft.form.sessionId);
+      setStimulusId(draft.form.stimulusId);
+      setTrialId(draft.form.trialId);
+      setStimulusEmotion(draft.form.stimulusEmotion);
+      setExperimentalCondition(draft.form.experimentalCondition);
+      const restoredTime = Math.min(Math.max(draft.currentTime, draft.clipStart), draft.clipEnd);
+      video.currentTime = restoredTime;
+      setCurrentTime(restoredTime);
+      const requiresReextraction = draft.auditEvents.some((event) => event.detail === "draft_processing_version_changed_reextract_required");
+      setDraftStatus(requiresReextraction
+        ? "追蹤版本已更新：已保留剪輯、ROI 與表單設定，請重新提取特徵後再標註。"
+        : `已恢復 ${new Date(draft.savedAt).toLocaleString("zh-TW")} 的本機暫存`);
+      setRecoverableDraft(null);
+      restoreCandidateRef.current = null;
+      return;
+    }
+    restoreCandidateRef.current = null;
     setClipEnd(video.duration);
     video.currentTime = 0;
   };
@@ -168,9 +316,14 @@ export function App() {
       drawTrimMask(ctx, canvas.width, canvas.height);
     }
 
-    if (step === "annotate" && !video.paused) captureObservation(video);
-
-    if (roi) drawRoi(ctx, roi);
+    if (isExtracting) {
+      if (extractionTrackedRoiRef.current) drawRoi(ctx, extractionTrackedRoiRef.current, true);
+    } else if (step === "roi" && roi) {
+      drawRoi(ctx, roi, false);
+    } else if (step === "annotate") {
+      const trackedRoi = trackedRoiForTime(samples, video.currentTime, clipStart, FPS);
+      if (trackedRoi) drawRoi(ctx, trackedRoi, true);
+    }
   };
 
   const drawTrimMask = (ctx: CanvasRenderingContext2D, width: number, height: number) => {
@@ -181,12 +334,23 @@ export function App() {
     ctx.fillRect(endX, 0, width - endX, height);
   };
 
-  const drawRoi = (ctx: CanvasRenderingContext2D, rect: Rect) => {
+  const drawRoi = (ctx: CanvasRenderingContext2D, rect: Rect, tracked: boolean) => {
     ctx.save();
     ctx.strokeStyle = "#0f9f87";
     ctx.lineWidth = Math.max(3, rect.size * 0.01);
-    ctx.setLineDash([12, 8]);
+    ctx.setLineDash(tracked ? [] : [12, 8]);
     ctx.strokeRect(rect.x, rect.y, rect.size, rect.size);
+    if (tracked) {
+      const fontSize = Math.max(14, Math.min(24, rect.size * 0.075));
+      const label = "TRACKED FACE";
+      ctx.font = `700 ${fontSize}px sans-serif`;
+      const labelWidth = ctx.measureText(label).width + 16;
+      const labelY = Math.max(fontSize + 6, rect.y - 8);
+      ctx.fillStyle = "#0f9f87";
+      ctx.fillRect(rect.x, labelY - fontSize - 6, labelWidth, fontSize + 8);
+      ctx.fillStyle = "#ffffff";
+      ctx.fillText(label, rect.x + 8, labelY - 4);
+    }
     ctx.restore();
   };
 
@@ -225,56 +389,99 @@ export function App() {
     setDragStart(null);
   };
 
-  const beginAnnotation = () => {
-    setSamples(createTimeline(clipStart, clipEnd, FPS));
-    lastSampleRef.current = { valence: -1, arousal: -1 };
+  const beginAnnotation = async () => {
+    const video = videoRef.current;
+    const selectedRoi = roi;
+    if (!video || !selectedRoi || isExtracting) return;
+    extractionCancelledRef.current = false;
+    setIsExtracting(true);
+    setExtractionProgress(0);
+    setExtractionError("");
+    setFeatureQa(null);
+    extractionTrackedRoiRef.current = null;
     setValenceDone(false);
     setArousalDone(false);
-    setStep("annotate");
-  };
-
-  const captureObservation = (video: HTMLVideoElement) => {
-    const activeMode = modeRef.current;
-    if (!activeMode || !landmarkerRef.current || video.currentTime < clipStart || video.currentTime > clipEnd) return;
-    const sampleIndex = Math.max(0, Math.min(samples.size - 1, Math.round((video.currentTime - clipStart) * FPS)));
-    if (sampleIndex <= lastSampleRef.current[activeMode]) return;
-    let observation;
+    setMode(null);
+    modeRef.current = null;
+    labelTrajectoryRef.current = { valence: [], arousal: [] };
     try {
-      observation = detectFace(landmarkerRef.current, video, performance.now());
+      // A new detector guarantees that VIDEO tracking state never crosses videos or seeks.
+      landmarkerRef.current?.close();
+      const detector = await createFaceLandmarker();
+      landmarkerRef.current = detector;
+      const timeline = createTimeline(clipStart, clipEnd, FPS);
+      let trackingRoi = selectedRoi;
+      let consecutiveMisses = 0;
+      for (const [sampleIndex, sample] of timeline) {
+        if (extractionCancelledRef.current) return;
+        const decodedFrame = await seekToDecodedFrame(video, sample.targetTime);
+        const searchPlan = faceSearchPlan(consecutiveMisses);
+        const observation = detectFace(detector, video, sampleIndex * (1000 / FPS), trackingRoi, searchPlan);
+        const trackFound = observation.detected && observation.identityMatch && observation.roi !== null;
+        if (trackFound && observation.roi) {
+          if (consecutiveMisses > 0) {
+            eventsRef.current.push({
+              event: "track_reacquired",
+              mediaTime: sample.targetTime,
+              recordedAt: new Date().toISOString(),
+              mode: null,
+              detail: `sample_index=${sampleIndex};after_misses=${consecutiveMisses};search=${searchPlan.mode}`,
+            });
+          }
+          extractionTrackedRoiRef.current = observation.roi;
+          trackingRoi = advanceTrackingRoi(trackingRoi, observation.roi, video.videoWidth, video.videoHeight);
+          consecutiveMisses = 0;
+        } else {
+          // A missing frame remains visibly and analytically missing; never draw a stale face box.
+          extractionTrackedRoiRef.current = null;
+          consecutiveMisses += 1;
+        }
+        const extractedSample: AnnotationSample = {
+          ...sample,
+          sourceTimestamp: decodedFrame.mediaTime,
+          faceDetected: observation.detected,
+          identityMatch: observation.identityMatch,
+          roiOverlap: observation.roiOverlap,
+          qualityFlags: [...observation.qualityFlags, "model_confidence_not_exposed", decodedFrame.timestampSource],
+          exclusionReason: null,
+          roi: observation.roi,
+          landmarks: observation.landmarks,
+          normalizedLandmarks: observation.normalizedLandmarks,
+          headPose: observation.headPose,
+          geometry: observation.geometry,
+          blendshapes: observation.blendshapes,
+        };
+        const droppedReasons = invalidFaceReasons(extractedSample);
+        extractedSample.exclusionReason = droppedReasons[0] ?? null;
+        timeline.set(sampleIndex, extractedSample);
+        if (droppedReasons.length) {
+          eventsRef.current.push({
+            event: "dropped_sample",
+            mediaTime: sample.targetTime,
+            recordedAt: new Date().toISOString(),
+            mode: null,
+            detail: `sample_index=${sampleIndex};${droppedReasons.join("|")}`,
+          });
+        }
+        if (sampleIndex % 5 === 0 || sampleIndex === timeline.size - 1) {
+          setExtractionProgress((sampleIndex + 1) / timeline.size);
+          await yieldToBrowser();
+        }
+      }
+      if (extractionCancelledRef.current) return;
+      const extractedFeatureQa = buildFeatureQaReport([...timeline.values()]);
+      setSamples(timeline);
+      setFeatureQa(extractedFeatureQa);
+      video.currentTime = clipStart;
+      setCurrentTime(clipStart);
+      setStep("annotate");
     } catch (error) {
       console.error(error);
-      return;
+      setExtractionError(error instanceof Error ? error.message : "特徵提取失敗");
+    } finally {
+      extractionTrackedRoiRef.current = null;
+      setIsExtracting(false);
     }
-    const from = lastSampleRef.current[activeMode] + 1;
-    if (sampleIndex > from) logEvent("dropped_sample", video.currentTime, `補記 ${from}-${sampleIndex - 1}`);
-    setSamples((prev) => {
-      const next = new Map(prev);
-      for (let index = from; index <= sampleIndex; index += 1) {
-        const current = next.get(index);
-        if (!current) continue;
-        const useObservation = index === sampleIndex;
-        next.set(index, {
-          ...current,
-          valenceRaw: activeMode === "valence" ? round2(valenceRef.current) : current.valenceRaw,
-          arousalRaw: activeMode === "arousal" ? round2(arousalRef.current) : current.arousalRaw,
-          // Keep null unless the container's true frame index is available; a playback counter is not a source-frame index.
-          sourceFrameIndex: current.sourceFrameIndex,
-          sourceTimestamp: useObservation ? Number(video.currentTime.toFixed(6)) : current.sourceTimestamp,
-          faceDetected: useObservation ? observation.detected : current.faceDetected,
-          qualityFlags: useObservation
-            ? [...observation.qualityFlags, "model_confidence_not_exposed"]
-            : Array.from(new Set([...current.qualityFlags.filter((flag) => flag !== "not_processed"), "dropped_source_frame"])),
-          roi: useObservation ? observation.roi : current.roi,
-          landmarks: useObservation ? observation.landmarks : current.landmarks,
-          normalizedLandmarks: useObservation ? observation.normalizedLandmarks : current.normalizedLandmarks,
-          headPose: useObservation ? observation.headPose : current.headPose,
-          geometry: useObservation ? observation.geometry : current.geometry,
-          exclusionReason: useObservation && !observation.detected ? "face_not_detected" : current.exclusionReason,
-        });
-      }
-      return next;
-    });
-    lastSampleRef.current[activeMode] = sampleIndex;
   };
 
   const playClip = () => {
@@ -286,6 +493,14 @@ export function App() {
     setIsPlaying(true);
   };
 
+  const reviewFeatureSegment = (time: number) => {
+    pause();
+    const video = videoRef.current;
+    if (!video) return;
+    video.currentTime = Math.min(Math.max(time, clipStart), clipEnd);
+    setCurrentTime(video.currentTime);
+  };
+
   const pause = () => {
     if (videoRef.current && !videoRef.current.paused) logEvent("pause", videoRef.current.currentTime);
     videoRef.current?.pause();
@@ -293,27 +508,81 @@ export function App() {
   };
 
   const selectMode = (nextMode: "valence" | "arousal") => {
+    if (annotationBlocked) {
+      setAnnotationError("特徵 QA 未通過，請先修改剪輯範圍或重新框選臉部後再提取。");
+      return;
+    }
     pause();
+    setAnnotationError("");
     setMode(nextMode);
     modeRef.current = nextMode;
-    lastSampleRef.current[nextMode] = -1;
+    labelTrajectoryRef.current[nextMode] = [{
+      mediaTime: clipStart,
+      value: nextMode === "valence" ? valenceRef.current : arousalRef.current,
+    }];
+    setSamples((previous) => new Map([...previous].map(([index, sample]) => [index, {
+      ...sample,
+      valenceRaw: nextMode === "valence" ? null : sample.valenceRaw,
+      arousalRaw: nextMode === "arousal" ? null : sample.arousalRaw,
+    }])));
+    if (nextMode === "valence") setValenceDone(false);
+    else setArousalDone(false);
     const video = videoRef.current;
     if (video) { video.currentTime = clipStart; logEvent("seek", clipStart, `開始 ${nextMode}`); }
   };
 
   const finishMode = () => {
-    if (mode === "valence") setValenceDone(true);
-    if (mode === "arousal") setArousalDone(true);
+    const video = videoRef.current;
+    if (!mode || !video) return;
+    if (video.currentTime < clipEnd - 0.05) {
+      setAnnotationError("必須完整播放至片段結尾，才能完成這個維度的標註。");
+      return;
+    }
     pause();
+    finalizeLabels(mode);
+  };
+
+  const recordLabel = (dimension: "valence" | "arousal", value: number) => {
+    const mediaTime = videoRef.current?.currentTime ?? clipStart;
+    const trajectory = labelTrajectoryRef.current[dimension];
+    const point = { mediaTime: Number(mediaTime.toFixed(6)), value };
+    const last = trajectory.at(-1);
+    if (last && Math.abs(last.mediaTime - point.mediaTime) < 1e-6) trajectory[trajectory.length - 1] = point;
+    else trajectory.push(point);
+    logEvent("label_change", mediaTime, `${dimension}=${value}`);
+    setDraftRevision((revision) => revision + 1);
+  };
+
+  const finalizeLabels = (dimension: "valence" | "arousal") => {
+    const trajectory = labelTrajectoryRef.current[dimension];
+    if (!trajectory.length) return;
+    setSamples((previous) => {
+      const next = new Map(previous);
+      const values = reconstructCausalLabels([...next.values()], trajectory);
+      let index = 0;
+      for (const [sampleIndex, sample] of next) {
+        const value = values[index];
+        next.set(sampleIndex, {
+          ...sample,
+          valenceRaw: dimension === "valence" ? value : sample.valenceRaw,
+          arousalRaw: dimension === "arousal" ? value : sample.arousalRaw,
+        });
+        index += 1;
+      }
+      return next;
+    });
+    if (dimension === "valence") setValenceDone(true);
+    else setArousalDone(true);
     setMode(null);
     modeRef.current = null;
+    setAnnotationError("");
   };
 
   const logEvent = (event: AuditEvent["event"], mediaTime: number, detail?: string) => {
     eventsRef.current.push({ event, mediaTime: Number(mediaTime.toFixed(6)), recordedAt: new Date().toISOString(), mode: modeRef.current, detail });
   };
 
-  const exportCsv = () => {
+  const exportDataset = async () => {
     if (!participantId || !/^\d+$/.test(participantId)) {
       setExportError("請輸入正確的參與者編號");
       return;
@@ -324,28 +593,41 @@ export function App() {
     }
     const resolvedSessionId = sessionId || `${participantId}-${sequenceNumber}`;
     const anonymousVideoId = `${resolvedSessionId}-${stimulusId}-${trialId}`;
+    const client = readClientEnvironment();
     const metadata: SessionMetadata = {
       participantId, sessionId: resolvedSessionId, stimulusId, trialId, anonymousVideoId,
       biologicalSex: gender, stimulusEmotion, stimulusOrder: Number(sequenceNumber), experimentalCondition,
-      videoOriginalName: videoFile?.name ?? "video.mp4", videoDurationSec: duration,
-      clipStartSec: clipStart, clipEndSec: clipEnd, sourceFps: null, samplingHz: FPS,
-      annotationDelaySec, smoothingWindowSec: 0.5, annotatedAt: new Date().toISOString(),
-      toolVersion: "0.2.0", landmarkModelVersion: LANDMARK_MODEL_VERSION,
-      schemaVersion: "2.0.0", processingVersion: "deterministic-10hz-v1",
+      sourceVideoSizeBytes: videoFile?.size ?? 0, videoDurationSec: duration,
+      clipStartSec: clipStart, clipEndSec: clipEnd, sourceFps: null, samplingHz: RESEARCH_PROTOCOL.samplingHz,
+      annotationDelaySec: RESEARCH_PROTOCOL.annotationDelaySec,
+      smoothingWindowSec: RESEARCH_PROTOCOL.smoothingWindowSec,
+      annotatedAt: new Date().toISOString(),
+      toolVersion: TOOL_VERSION, landmarkModelVersion: LANDMARK_MODEL_VERSION,
+      schemaVersion: SCHEMA_VERSION, processingVersion: PROCESSING_VERSION,
+      protocolVersion: RESEARCH_PROTOCOL.protocolVersion,
+      targetConstruct: RESEARCH_PROTOCOL.targetConstruct,
+      ...client,
     };
-    const expectedSampleCount = Math.floor((clipEnd - clipStart) * FPS) + 1;
-    const qa = buildQaReport(sortedSamples, expectedSampleCount);
-    downloadText(buildMetadata(metadata, eventsRef.current, qa), `${anonymousVideoId}_metadata_qa.json`, "application/json");
-    if (!qa.passed) {
-      setExportError(`QA 未通過，已下載報告：${qa.rejectionReasons.join("；")}`);
-      return;
+    const qa = buildQaReport(sortedSamples, metadata);
+    setIsExporting(true);
+    try {
+      const bundle = await buildExportBundle(sortedSamples, metadata, eventsRef.current, qa);
+      downloadBlob(bundle.blob, bundle.filename);
+      if (!qa.passed) {
+        setExportError(`QA 未通過；已下載僅含報告的 ZIP：${qa.rejectionReasons.join("；")}`);
+        return;
+      }
+      setIsExportOpen(false);
+      setExportError("");
+      setExportSuccess(bundle.filename);
+    } catch (error) {
+      setExportError(error instanceof Error ? error.message : "ZIP 建立失敗，請勿結束 session 並聯絡研究人員。" );
+    } finally {
+      setIsExporting(false);
     }
-    downloadText(buildCsv(sortedSamples, metadata), `${anonymousVideoId}_landmarks.csv`, "text/csv;charset=utf-8");
-    setIsExportOpen(false);
-    setExportError("");
   };
 
-  const resetSession = () => {
+  const resetSession = (clearStored = false) => {
     pause();
     if (videoUrl) URL.revokeObjectURL(videoUrl);
     setVideoFile(null);
@@ -356,6 +638,7 @@ export function App() {
     setStep("clip");
     setRoi(null);
     setSamples(new Map());
+    setFeatureQa(null);
     setValenceDone(false);
     setArousalDone(false);
     setMode(null);
@@ -369,18 +652,51 @@ export function App() {
     setTrialId("01");
     setStimulusEmotion("");
     eventsRef.current = [];
+    labelTrajectoryRef.current = { valence: [], arousal: [] };
+    extractionCancelledRef.current = true;
+    setExtractionProgress(0);
+    setExtractionError("");
+    setAnnotationError("");
+    setExportSuccess("");
+    setDraftStatus("");
+    restoreCandidateRef.current = null;
+    if (clearStored) {
+      void clearDraft();
+      setRecoverableDraft(null);
+    }
+  };
+
+  const discardAndReset = () => {
+    if (videoFile && !window.confirm("確定放棄目前 session？本機暫存也會一併刪除。")) return;
+    resetSession(true);
+  };
+
+  const confirmExportAndFinish = async () => {
+    await clearDraft();
+    resetSession(false);
+    setRecoverableDraft(null);
   };
 
   const setStart = (value: number) => {
     const next = Math.min(value, clipEnd - 0.2);
     setClipStart(round2(next));
+    setSamples(new Map());
+    setFeatureQa(null);
+    setValenceDone(false);
+    setArousalDone(false);
     if (videoRef.current) videoRef.current.currentTime = next;
+    logEvent("seek", next, "clip_start_change");
   };
 
   const setEnd = (value: number) => {
     const next = Math.max(value, clipStart + 0.2);
     setClipEnd(round2(next));
+    setSamples(new Map());
+    setFeatureQa(null);
+    setValenceDone(false);
+    setArousalDone(false);
     if (videoRef.current) videoRef.current.currentTime = next;
+    logEvent("seek", next, "clip_end_change");
   };
 
   return (
@@ -397,12 +713,37 @@ export function App() {
             </div>
           </div>
           {videoFile ? (
-            <Button variant="ghost" size="sm" onClick={resetSession} className="reset-upload">
+            <Button variant="ghost" size="sm" onClick={discardAndReset} className="reset-upload">
               <RotateCcw size={14} /> 重新上傳影片
             </Button>
           ) : null}
         </div>
       </header>
+
+      <div className="notice-stack" aria-live="polite">
+        {browserIncompatible ? (
+          <div className="studio-notice is-error" role="alert">
+            <AlertTriangle size={20} />
+            <div>
+              <strong>這個瀏覽器無法執行正式資料蒐集</strong>
+              <span>{compatibilityIssues.join("；")}</span>
+            </div>
+          </div>
+        ) : null}
+        {tabletPortrait && videoFile ? (
+          <div className="studio-notice is-warning" role="alert">
+            <AlertTriangle size={20} />
+            <div><strong>請將平板旋轉為橫向</strong><span>ROI 與 V/A 正式標註只允許橫向操作，確保影片與滑桿能同時看見。</span></div>
+          </div>
+        ) : null}
+        {!videoFile && recoverableDraft ? (
+          <div className="studio-notice">
+            <Check size={20} />
+            <div><strong>找到未完成的本機暫存</strong><span>請重新選取同一支影片；工具會依檔案大小與修改時間恢復，不會保存原始影片。</span></div>
+          </div>
+        ) : null}
+        {draftStatus && videoFile ? <div className="draft-status">{draftStatus}</div> : null}
+      </div>
 
       <section className="studio-grid">
         <div className="workspace-column">
@@ -414,8 +755,8 @@ export function App() {
             onPointerCancel={endRoi}
           >
             {!videoUrl ? (
-              <label className="studio-upload">
-                <input className="sr-only" type="file" accept="video/mp4" onChange={onUpload} />
+              <label className={`studio-upload ${browserIncompatible ? "is-disabled" : ""}`}>
+                <input className="sr-only" type="file" accept="video/mp4,.mp4" disabled={browserIncompatible} onChange={onUpload} />
                 <div className="upload-orb">
                   <Upload size={36} />
                 </div>
@@ -453,7 +794,7 @@ export function App() {
                 {step === "clip" ? "影片剪輯" : step === "roi" ? "臉部位置標註" : mode === "arousal" ? "喚醒度標註" : "愉悅度標註"}
               </CardTitle>
               <p className="panel-description">
-                {step === "clip" ? "先設定影片起訖點，畫面遮罩會標示捨棄片段。" : step === "roi" ? "在影片畫面滑動框選正方形臉部 ROI，後續會依此追蹤。" : "分兩階段錄製愉悅度與喚醒度，完成後匯出 LSTM CSV。"}
+                {step === "clip" ? "先設定影片起訖點，畫面遮罩會標示捨棄片段。" : step === "roi" ? "框住完整臉部並在四周保留空間；工具會自動擴大搜尋並在失去追蹤後重新鎖定。" : annotationBlocked ? "特徵 QA 未通過；V/A 已暫時鎖定，請先檢查問題片段。" : "分兩階段錄製愉悅度與喚醒度；綠色實線框顯示每個 10 Hz 樣本的實際偵測位置。"}
               </p>
             </CardHeader>
             <CardContent className="control-content">
@@ -472,49 +813,52 @@ export function App() {
                   <div className="roi-card">
                     <SquareDashedMousePointer size={22} />
                     <div>
-                      <strong>{roi && roi.size >= 24 ? "ROI 已選取" : "等待框選臉部"}</strong>
-                      <span>{roi ? `${Math.round(roi.size)} x ${Math.round(roi.size)} px` : "請在左側影片上拖曳出正方形範圍"}</span>
+                      <strong>{roi && roi.size >= 24 ? "身份錨點已選取" : "等待框選臉部"}</strong>
+                      <span>{roi ? `${Math.round(roi.size)} x ${Math.round(roi.size)} px；請確認包含完整臉部及四周約 20–30% 空間` : "請在左側影片上拖曳出包含完整臉部的正方形範圍"}</span>
                     </div>
                   </div>
                   <div className="two-actions">
                     <Button variant="outline" onClick={() => setStep("clip")}>
                       <ArrowLeft size={18} /> 修改剪輯
                     </Button>
-                    <Button disabled={!roi || roi.size < 24 || modelStatus !== "ready"} onClick={beginAnnotation}>
-                      <Check size={18} /> 開始標註
+                    <Button disabled={!roi || roi.size < 24 || modelStatus !== "ready" || isExtracting || tabletPortrait || browserIncompatible} onClick={beginAnnotation}>
+                      <Check size={18} /> {isExtracting ? `正在提取 ${Math.round(extractionProgress * 100)}%` : "提取特徵並開始標註"}
                     </Button>
                   </div>
                   <p className={modelStatus === "error" ? "dialog-error" : "panel-description"}>
-                    {modelStatus === "ready" ? "真實臉部特徵模型已就緒" : modelStatus === "error" ? "臉部特徵模型載入失敗，無法開始正式標註" : "正在載入臉部特徵模型…"}
+                    {browserIncompatible ? "瀏覽器相容性檢查未通過，無法開始正式標註" : isExtracting ? "正在依固定 10 Hz 提取；遺失追蹤時會逐級擴大到全畫面搜尋。" : modelStatus === "ready" ? "真實臉部特徵模型已就緒" : modelStatus === "error" ? "臉部特徵模型載入失敗，無法開始正式標註" : "正在載入臉部特徵模型…"}
                   </p>
+                  {extractionError ? <p className="dialog-error">{extractionError}</p> : null}
                 </div>
               ) : null}
 
               {step === "annotate" ? (
                 <div className="control-stack">
+                  {featureQa ? <FeatureQaCard report={featureQa} onReview={reviewFeatureSegment} /> : null}
                   <div className="mode-tabs">
-                    <Button variant={mode === "valence" ? "default" : "outline"} onClick={() => selectMode("valence")}>
+                    <Button disabled={annotationBlocked} variant={mode === "valence" ? "default" : "outline"} onClick={() => selectMode("valence")}>
                       標註愉悅度
                     </Button>
-                    <Button variant={mode === "arousal" ? "default" : "outline"} onClick={() => selectMode("arousal")}>
+                    <Button disabled={annotationBlocked} variant={mode === "arousal" ? "default" : "outline"} onClick={() => selectMode("arousal")}>
                       標註喚醒度
                     </Button>
                   </div>
 
-                  <AffectiveControl label="愉悅度 Valence" low="UNPLEASANT" high="PLEASANT" value={valence} disabled={mode !== "valence"} onChange={(next) => { setValence(next); logEvent("label_change", videoRef.current?.currentTime ?? 0, `valence=${next}`); }} />
-                  <AffectiveControl label="喚醒度 Arousal" low="CALM" high="EXCITED" value={arousal} disabled={mode !== "arousal"} onChange={(next) => { setArousal(next); logEvent("label_change", videoRef.current?.currentTime ?? 0, `arousal=${next}`); }} />
+                  <AffectiveControl label="愉悅度 Valence" low="UNPLEASANT" high="PLEASANT" value={valence} disabled={annotationBlocked || mode !== "valence"} onChange={(next) => { valenceRef.current = next; setValence(next); recordLabel("valence", next); }} />
+                  <AffectiveControl label="喚醒度 Arousal" low="CALM" high="EXCITED" value={arousal} disabled={annotationBlocked || mode !== "arousal"} onChange={(next) => { arousalRef.current = next; setArousal(next); recordLabel("arousal", next); }} />
 
                   <div className="three-actions">
-                    <Button variant="secondary" onClick={isPlaying ? pause : playClip} disabled={!mode}>
+                    <Button variant="secondary" onClick={isPlaying ? pause : playClip} disabled={!mode || tabletPortrait}>
                       {isPlaying ? <Pause size={18} /> : <Play size={18} />} {isPlaying ? "暫停" : "播放"}
                     </Button>
                     <Button variant="outline" onClick={finishMode} disabled={!mode}>
                       <Check size={18} /> 完成
                     </Button>
-                    <Button variant="outline" onClick={() => { pause(); setStep("roi"); setRoi(null); }}>
+                    <Button variant="outline" onClick={() => { pause(); setStep("roi"); setRoi(null); setFeatureQa(null); }}>
                       <RotateCcw size={18} /> 重標
                     </Button>
                   </div>
+                  {annotationError ? <p className="dialog-error">{annotationError}</p> : null}
 
                   <div className="completion-grid">
                     <Status label="愉悅度" done={valenceDone} />
@@ -538,7 +882,7 @@ export function App() {
 
       <footer className="studio-footer">
         <span>2026 AF-STUDIO</span>
-        <span>LSTM CSV EXPORT</span>
+        <span>RESEARCH ZIP EXPORT</span>
       </footer>
 
       {isExportOpen ? (
@@ -589,19 +933,78 @@ export function App() {
                   <input value={experimentalCondition} onChange={(e) => setExperimentalCondition(e.target.value)} />
                 </label>
                 <label>
-                  <span>固定延遲校正（秒）</span>
-                  <input type="number" min="0" max="10" step="0.1" value={annotationDelaySec} onChange={(e) => setAnnotationDelaySec(Number(e.target.value))} />
+                  <span>研究 Protocol（唯讀）</span>
+                  <input readOnly value={`${RESEARCH_PROTOCOL.protocolVersion}｜延遲 ${RESEARCH_PROTOCOL.annotationDelaySec.toFixed(1)} 秒`} />
                 </label>
               </div>
               {exportError ? <p className="dialog-error">{exportError}</p> : null}
-              <Button onClick={exportCsv} className="primary-action">
-                <Download size={18} /> 執行 QA 並下載
+              <Button onClick={exportDataset} disabled={isExporting} className="primary-action">
+                <Download size={18} /> {isExporting ? "正在建立 ZIP…" : "執行 QA 並下載 ZIP"}
+              </Button>
+            </div>
+          </div>
+        </div>
+      ) : null}
+
+      {exportSuccess ? (
+        <div className="dialog-backdrop" role="presentation">
+          <div className="export-dialog export-success" role="dialog" aria-modal="true" aria-labelledby="export-success-title">
+            <div className="dialog-header">
+              <h2 id="export-success-title">ZIP 已建立</h2>
+              <p>請先在平板的「下載項目／檔案」確認下列檔案存在，再結束 session。</p>
+            </div>
+            <div className="dialog-body">
+              <code>{exportSuccess}</code>
+              <p className="privacy-note">ZIP 內含 dataset.csv、metadata_qa.json 與 SHA-256 manifest；不包含原始影片檔名。</p>
+              <Button onClick={confirmExportAndFinish} className="primary-action">
+                <Check size={18} /> 我已確認檔案存在，結束 session
               </Button>
             </div>
           </div>
         </div>
       ) : null}
     </main>
+  );
+}
+
+const FACE_REASON_LABELS: Record<string, string> = {
+  face_not_detected: "未偵測到臉",
+  identity_roi_mismatch: "身份／追蹤位置不符",
+  partially_out_of_crop: "臉部超出搜尋範圍",
+  face_too_small: "臉部尺寸太小",
+  non_finite_landmarks: "landmark 數值異常",
+  landmark_count_mismatch: "landmark 點數異常",
+  invalid_source_timestamp: "來源影格時間無效",
+};
+
+function FeatureQaCard({ report, onReview }: { report: FeatureQaReport; onReview: (time: number) => void }) {
+  const percent = (report.validFaceRate * 100).toFixed(1);
+  return (
+    <section className={`feature-qa ${report.passed ? "is-passed" : "is-failed"}`} aria-live="polite">
+      <div className="feature-qa-heading">
+        {report.passed ? <Check size={20} /> : <AlertTriangle size={20} />}
+        <div>
+          <strong>{report.passed ? `特徵 QA 通過｜${percent}%` : `特徵 QA 未通過｜${percent}%`}</strong>
+          <span>{report.validFaceCount} / {report.sampleCount} 個 10 Hz 樣本有效</span>
+        </div>
+      </div>
+      {!report.passed ? (
+        <p>V/A 標註已鎖定。請點選問題區段檢查，再修改剪輯或重新框選臉部。</p>
+      ) : null}
+      {report.invalidFaceSegments.length ? (
+        <div className="feature-qa-segments">
+          {report.invalidFaceSegments.slice(0, 4).map((segment) => (
+            <button key={`${segment.startSampleIndex}-${segment.endSampleIndex}`} type="button" onClick={() => onReview(segment.startTimeSec)}>
+              <span>{formatTime(segment.startTimeSec)}–{formatTime(segment.endTimeSec)}</span>
+              <small>{segment.sampleCount} 筆｜{segment.reasons.map((reason) => FACE_REASON_LABELS[reason] ?? reason).join("、")}</small>
+            </button>
+          ))}
+          {report.invalidFaceSegments.length > 4 ? <small>另有 {report.invalidFaceSegments.length - 4} 個問題區段，完整明細會保存在 QA 報告。</small> : null}
+        </div>
+      ) : (
+        <p>所有樣本皆有有效的目標臉部特徵。</p>
+      )}
+    </section>
   );
 }
 
@@ -628,4 +1031,57 @@ function Status({ label, done }: { label: string; done: boolean }) {
       <strong>{done ? "已完成" : "未完成"}</strong>
     </div>
   );
+}
+
+async function seekToDecodedFrame(video: HTMLVideoElement, targetTime: number) {
+  const videoFrames = video as HTMLVideoElement & {
+    requestVideoFrameCallback?: (callback: (_now: number, metadata: { mediaTime: number }) => void) => number;
+    cancelVideoFrameCallback?: (handle: number) => void;
+  };
+  const needsSeek = Math.abs(video.currentTime - targetTime) > 1e-4 || video.readyState < HTMLMediaElement.HAVE_CURRENT_DATA;
+  if (!needsSeek) {
+    return { mediaTime: Number(video.currentTime.toFixed(6)), timestampSource: "source_timestamp_current_frame" };
+  }
+  let frameHandle: number | null = null;
+  const frameMetadata = videoFrames.requestVideoFrameCallback
+    ? new Promise<number | null>((resolve) => {
+        let settled = false;
+        let timeout = 0;
+        const finish = (mediaTime: number | null) => {
+          if (settled) return;
+          settled = true;
+          window.clearTimeout(timeout);
+          resolve(mediaTime);
+        };
+        frameHandle = videoFrames.requestVideoFrameCallback!((_now, metadata) => finish(metadata.mediaTime));
+        timeout = window.setTimeout(() => {
+          if (frameHandle !== null) videoFrames.cancelVideoFrameCallback?.(frameHandle);
+          finish(null);
+        }, 500);
+      })
+    : Promise.resolve(null);
+  await new Promise<void>((resolve, reject) => {
+      const timeout = window.setTimeout(() => {
+        cleanup();
+        reject(new Error(`影片在 ${targetTime.toFixed(3)} 秒 seek 逾時`));
+      }, 8000);
+      const cleanup = () => {
+        window.clearTimeout(timeout);
+        video.removeEventListener("seeked", onSeeked);
+        video.removeEventListener("error", onError);
+      };
+      const onSeeked = () => { cleanup(); resolve(); };
+      const onError = () => { cleanup(); reject(new Error("影片解碼失敗")); };
+      video.addEventListener("seeked", onSeeked, { once: true });
+      video.addEventListener("error", onError, { once: true });
+      video.currentTime = targetTime;
+  });
+  const decodedMediaTime = await frameMetadata;
+  return decodedMediaTime === null
+    ? { mediaTime: Number(video.currentTime.toFixed(6)), timestampSource: "source_timestamp_current_time_fallback" }
+    : { mediaTime: Number(decodedMediaTime.toFixed(6)), timestampSource: "source_timestamp_video_frame_callback" };
+}
+
+function yieldToBrowser() {
+  return new Promise<void>((resolve) => window.setTimeout(resolve, 0));
 }

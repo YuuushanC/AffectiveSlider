@@ -1,34 +1,42 @@
 import { FaceLandmarker, FilesetResolver } from "@mediapipe/tasks-vision";
 import type { HeadPose, Point, Rect } from "../types";
+import { RESEARCH_PROTOCOL } from "../protocol";
+import { isPlausibleTrack, trackMetrics, type FaceSearchPlan } from "./tracking";
 
 export const LANDMARK_COUNT = 478;
 export const LANDMARK_MODEL_VERSION = "mediapipe-face-landmarker-float16-v1";
+export const BLENDSHAPE_NAMES = [
+  "_neutral", "browDownLeft", "browDownRight", "browInnerUp", "browOuterUpLeft", "browOuterUpRight",
+  "cheekPuff", "cheekSquintLeft", "cheekSquintRight", "eyeBlinkLeft", "eyeBlinkRight", "eyeLookDownLeft",
+  "eyeLookDownRight", "eyeLookInLeft", "eyeLookInRight", "eyeLookOutLeft", "eyeLookOutRight", "eyeLookUpLeft",
+  "eyeLookUpRight", "eyeSquintLeft", "eyeSquintRight", "eyeWideLeft", "eyeWideRight", "jawForward", "jawLeft",
+  "jawOpen", "jawRight", "mouthClose", "mouthDimpleLeft", "mouthDimpleRight", "mouthFrownLeft", "mouthFrownRight",
+  "mouthFunnel", "mouthLeft", "mouthLowerDownLeft", "mouthLowerDownRight", "mouthPressLeft", "mouthPressRight",
+  "mouthPucker", "mouthRight", "mouthRollLower", "mouthRollUpper", "mouthShrugLower", "mouthShrugUpper",
+  "mouthSmileLeft", "mouthSmileRight", "mouthStretchLeft", "mouthStretchRight", "mouthUpperUpLeft",
+  "mouthUpperUpRight", "noseSneerLeft", "noseSneerRight",
+] as const;
 
-let landmarkerPromise: Promise<FaceLandmarker> | null = null;
-
-export function createFaceLandmarker() {
-  if (!landmarkerPromise) {
-    landmarkerPromise = FilesetResolver.forVisionTasks("/mediapipe").then(async (vision) => {
-      const options = {
-        baseOptions: { modelAssetPath: "/models/face_landmarker.task", delegate: "GPU" },
-        runningMode: "VIDEO",
-        numFaces: 1,
-        minFaceDetectionConfidence: 0.5,
-        minFacePresenceConfidence: 0.5,
-        minTrackingConfidence: 0.5,
-        outputFacialTransformationMatrixes: true,
-      } as const;
-      try {
-        return await FaceLandmarker.createFromOptions(vision, options);
-      } catch {
-        return FaceLandmarker.createFromOptions(vision, {
-          ...options,
-          baseOptions: { modelAssetPath: "/models/face_landmarker.task", delegate: "CPU" },
-        });
-      }
+export async function createFaceLandmarker() {
+  const vision = await FilesetResolver.forVisionTasks("/mediapipe");
+  const options = {
+    baseOptions: { modelAssetPath: "/models/face_landmarker.task", delegate: "GPU" },
+    runningMode: "VIDEO",
+    numFaces: 2,
+    minFaceDetectionConfidence: 0.5,
+    minFacePresenceConfidence: 0.5,
+    minTrackingConfidence: 0.5,
+    outputFaceBlendshapes: true,
+    outputFacialTransformationMatrixes: true,
+  } as const;
+  try {
+    return await FaceLandmarker.createFromOptions(vision, options);
+  } catch {
+    return FaceLandmarker.createFromOptions(vision, {
+      ...options,
+      baseOptions: { modelAssetPath: "/models/face_landmarker.task", delegate: "CPU" },
     });
   }
-  return landmarkerPromise;
 }
 
 const clamp = (value: number, min: number, max: number) => Math.min(Math.max(value, min), max);
@@ -40,11 +48,14 @@ export function clampRect(rect: Rect, width: number, height: number): Rect {
 
 export interface FaceObservation {
   detected: boolean;
+  identityMatch: boolean;
+  roiOverlap: number | null;
   landmarks: Point[];
   normalizedLandmarks: Point[];
   roi: Rect | null;
   headPose: HeadPose;
   geometry: Record<string, number>;
+  blendshapes: Record<string, number>;
   qualityFlags: string[];
 }
 
@@ -52,50 +63,145 @@ export function detectFace(
   detector: FaceLandmarker,
   video: HTMLVideoElement,
   timestampMs: number,
+  expectedRoi: Rect,
+  searchPlan: FaceSearchPlan = {
+    padding: RESEARCH_PROTOCOL.trackedSearchPadding,
+    fullFrame: false,
+    maximumNormalizedDistance: 0.85,
+    mode: "tracked",
+  },
 ): FaceObservation {
-  const result = detector.detectForVideo(video, timestampMs);
-  const face = result.faceLandmarks[0];
-  if (!face || face.length < LANDMARK_COUNT) return emptyObservation("face_not_detected");
+  // Follow the previously detected participant face. The first frame is seeded by
+  // the manually selected ROI, preventing a face inside the stimulus from taking over.
+  const surface = createDetectionSurface(video, expectedRoi, searchPlan);
+  const context = surface.canvas.getContext("2d");
+  if (!context) return emptyObservation("crop_context_unavailable");
+  context.drawImage(
+    video,
+    surface.sourceX,
+    surface.sourceY,
+    surface.sourceWidth,
+    surface.sourceHeight,
+    0,
+    0,
+    surface.canvas.width,
+    surface.canvas.height,
+  );
 
-  const landmarks = face.slice(0, LANDMARK_COUNT).map((p) => ({
-    x: Number((p.x * video.videoWidth).toFixed(5)),
-    y: Number((p.y * video.videoHeight).toFixed(5)),
-    z: Number((p.z * video.videoWidth).toFixed(5)),
-  }));
+  const result = detector.detectForVideo(surface.canvas, timestampMs);
+  const candidates = result.faceLandmarks
+    .map((face, index) => {
+      if (face.length < LANDMARK_COUNT) return null;
+      const landmarks = face.slice(0, LANDMARK_COUNT).map((point) => ({
+        x: round(surface.sourceX + point.x * surface.sourceWidth),
+        y: round(surface.sourceY + point.y * surface.sourceHeight),
+        z: round(point.z * surface.sourceWidth),
+      }));
+      const roi = boundsFor(landmarks, video.videoWidth, video.videoHeight);
+      const metrics = trackMetrics(expectedRoi, roi);
+      const score = metrics.normalizedDistance + Math.abs(Math.log(Math.max(metrics.sizeRatio, 1e-6))) * 0.35;
+      return { face, index, landmarks, roi, score };
+    })
+    .filter((candidate): candidate is NonNullable<typeof candidate> => candidate !== null)
+    .sort((a, b) => a.score - b.score);
+  const candidate = candidates[0];
+  if (!candidate) return emptyObservation("face_not_detected");
+
+  const { face, index, landmarks, roi: detectedRoi } = candidate;
   const normalizedLandmarks = normalizeLandmarks(landmarks);
-  const roi = boundsFor(landmarks, video.videoWidth, video.videoHeight);
-  const matrix = result.facialTransformationMatrixes?.[0]?.data;
+  const roiOverlap = intersectionOverUnion(expectedRoi, detectedRoi);
+  const identityMatch = isPlausibleTrack(expectedRoi, detectedRoi, searchPlan.maximumNormalizedDistance);
+  const matrix = result.facialTransformationMatrixes?.[index]?.data;
   const headPose = matrix ? poseFromMatrix(Array.from(matrix)) : { pitch: null, yaw: null, roll: null };
+  const blendshapes = Object.fromEntries(
+    (result.faceBlendshapes?.[index]?.categories ?? []).map((category) => [category.categoryName, round(category.score)]),
+  );
   const qualityFlags: string[] = [];
-  if (face.some((p) => p.x < 0 || p.x > 1 || p.y < 0 || p.y > 1)) qualityFlags.push("partially_out_of_frame");
-  if (roi.size < 80) qualityFlags.push("face_too_small");
+  if (!identityMatch) qualityFlags.push("identity_roi_mismatch");
+  if (isPartiallyOutOfCrop(face)) qualityFlags.push("partially_out_of_crop");
+  if (detectedRoi.size < minimumFaceSizeForFrame(video.videoWidth, video.videoHeight)) qualityFlags.push("face_too_small");
+  if (!allFinite(landmarks) || !allFinite(normalizedLandmarks)) qualityFlags.push("non_finite_landmarks");
+  if (searchPlan.mode !== "tracked") qualityFlags.push(`search_${searchPlan.mode}`);
 
   return {
     detected: true,
+    identityMatch,
+    roiOverlap: round(roiOverlap),
     landmarks,
     normalizedLandmarks,
-    roi,
+    roi: detectedRoi,
     headPose,
     geometry: extractGeometry(normalizedLandmarks),
+    blendshapes,
     qualityFlags,
   };
+}
+
+interface DetectionSurface {
+  canvas: HTMLCanvasElement;
+  sourceX: number;
+  sourceY: number;
+  sourceWidth: number;
+  sourceHeight: number;
+}
+
+function createDetectionSurface(video: HTMLVideoElement, expectedRoi: Rect, searchPlan: FaceSearchPlan): DetectionSurface {
+  const canvas = document.createElement("canvas");
+  const source = searchPlan.fullFrame
+    ? { x: 0, y: 0, width: video.videoWidth, height: video.videoHeight }
+    : (() => {
+        const crop = expandedRect(expectedRoi, video.videoWidth, video.videoHeight, searchPlan.padding);
+        return { x: crop.x, y: crop.y, width: crop.size, height: crop.size };
+      })();
+  const downscale = Math.min(1, 960 / Math.max(source.width, source.height, 1));
+  canvas.width = Math.max(1, Math.round(source.width * downscale));
+  canvas.height = Math.max(1, Math.round(source.height * downscale));
+  return {
+    canvas,
+    sourceX: source.x,
+    sourceY: source.y,
+    sourceWidth: source.width,
+    sourceHeight: source.height,
+  };
+}
+
+export function isPartiallyOutOfCrop(points: Array<{ x: number; y: number }>) {
+  if (!points.length) return true;
+  const tolerance = RESEARCH_PROTOCOL.cropBoundaryTolerance;
+  const outliers = points.filter((point) => (
+    point.x < -tolerance || point.x > 1 + tolerance || point.y < -tolerance || point.y > 1 + tolerance
+  )).length;
+  return outliers / points.length > RESEARCH_PROTOCOL.maximumCropBoundaryOutlierFraction;
+}
+
+export function minimumFaceSizeForFrame(width: number, height: number) {
+  const relativeSize = Math.min(width, height) * RESEARCH_PROTOCOL.minimumFaceFrameRatio;
+  return clamp(relativeSize, RESEARCH_PROTOCOL.minimumFacePixelsFloor, RESEARCH_PROTOCOL.minimumFacePixelsCeiling);
 }
 
 function emptyObservation(reason: string): FaceObservation {
   return {
     detected: false,
+    identityMatch: false,
+    roiOverlap: null,
     landmarks: [],
     normalizedLandmarks: [],
     roi: null,
     headPose: { pitch: null, yaw: null, roll: null },
     geometry: {},
+    blendshapes: {},
     qualityFlags: [reason],
   };
 }
 
+function expandedRect(rect: Rect, width: number, height: number, padding: number): Rect {
+  const requestedSize = rect.size * (1 + padding * 2);
+  return clampRect({ x: rect.x - rect.size * padding, y: rect.y - rect.size * padding, size: requestedSize }, width, height);
+}
+
 function boundsFor(points: Point[], width: number, height: number): Rect {
-  const xs = points.map((p) => p.x);
-  const ys = points.map((p) => p.y);
+  const xs = points.map((point) => point.x);
+  const ys = points.map((point) => point.y);
   const minX = Math.min(...xs);
   const maxX = Math.max(...xs);
   const minY = Math.min(...ys);
@@ -105,50 +211,63 @@ function boundsFor(points: Point[], width: number, height: number): Rect {
 }
 
 export function normalizeLandmarks(points: Point[]): Point[] {
-  // MediaPipe eye-corner indices. Normalize translation, in-plane rotation and scale.
   const left = points[33];
   const right = points[263];
   if (!left || !right) return [];
-  const cx = (left.x + right.x) / 2;
-  const cy = (left.y + right.y) / 2;
-  const dx = right.x - left.x;
-  const dy = right.y - left.y;
-  const scale = Math.hypot(dx, dy) || 1;
-  const angle = Math.atan2(dy, dx);
+  const centerX = (left.x + right.x) / 2;
+  const centerY = (left.y + right.y) / 2;
+  const deltaX = right.x - left.x;
+  const deltaY = right.y - left.y;
+  const scale = Math.hypot(deltaX, deltaY) || 1;
+  const angle = Math.atan2(deltaY, deltaX);
   const cos = Math.cos(-angle);
   const sin = Math.sin(-angle);
-  return points.map((p) => {
-    const x = p.x - cx;
-    const y = p.y - cy;
+  return points.map((point) => {
+    const x = point.x - centerX;
+    const y = point.y - centerY;
     return {
-      x: Number(((x * cos - y * sin) / scale).toFixed(6)),
-      y: Number(((x * sin + y * cos) / scale).toFixed(6)),
-      z: Number(((p.z ?? 0) / scale).toFixed(6)),
+      x: round((x * cos - y * sin) / scale),
+      y: round((x * sin + y * cos) / scale),
+      z: round((point.z ?? 0) / scale),
     };
   });
 }
 
 export function extractGeometry(points: Point[]) {
   if (points.length < LANDMARK_COUNT) return {};
-  const dist = (a: number, b: number) => Math.hypot(points[a].x - points[b].x, points[a].y - points[b].y);
+  const distance = (a: number, b: number) => Math.hypot(points[a].x - points[b].x, points[a].y - points[b].y);
   return {
-    face_width: round(dist(234, 454)),
-    eye_distance: round(dist(33, 263)),
-    left_eye_open: round((dist(159, 145) + dist(158, 153)) / 2),
-    right_eye_open: round((dist(386, 374) + dist(385, 380)) / 2),
-    mouth_width: round(dist(61, 291)),
-    mouth_open: round(dist(13, 14)),
-    nose_to_mouth: round(dist(1, 13)),
+    face_width: round(distance(234, 454)),
+    eye_distance: round(distance(33, 263)),
+    left_eye_open: round((distance(159, 145) + distance(158, 153)) / 2),
+    right_eye_open: round((distance(386, 374) + distance(385, 380)) / 2),
+    mouth_width: round(distance(61, 291)),
+    mouth_open: round(distance(13, 14)),
+    nose_to_mouth: round(distance(1, 13)),
   };
 }
 
-function poseFromMatrix(m: number[]): HeadPose {
-  if (m.length < 16) return { pitch: null, yaw: null, roll: null };
-  const pitch = Math.atan2(m[9], m[10]);
-  const yaw = Math.asin(clamp(-m[8], -1, 1));
-  const roll = Math.atan2(m[4], m[0]);
-  const degrees = (v: number) => round((v * 180) / Math.PI);
-  return { pitch: degrees(pitch), yaw: degrees(yaw), roll: degrees(roll) };
+function poseFromMatrix(matrix: number[]): HeadPose {
+  if (matrix.length < 16) return { pitch: null, yaw: null, roll: null };
+  const degrees = (value: number) => round((value * 180) / Math.PI);
+  return {
+    pitch: degrees(Math.atan2(matrix[9], matrix[10])),
+    yaw: degrees(Math.asin(clamp(-matrix[8], -1, 1))),
+    roll: degrees(Math.atan2(matrix[4], matrix[0])),
+  };
+}
+
+function intersectionOverUnion(a: Rect, b: Rect) {
+  const left = Math.max(a.x, b.x);
+  const top = Math.max(a.y, b.y);
+  const right = Math.min(a.x + a.size, b.x + b.size);
+  const bottom = Math.min(a.y + a.size, b.y + b.size);
+  const intersection = Math.max(0, right - left) * Math.max(0, bottom - top);
+  return intersection / (a.size * a.size + b.size * b.size - intersection || 1);
+}
+
+function allFinite(points: Point[]) {
+  return points.every((point) => Number.isFinite(point.x) && Number.isFinite(point.y) && Number.isFinite(point.z ?? 0));
 }
 
 function round(value: number) {
