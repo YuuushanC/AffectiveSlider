@@ -1,6 +1,7 @@
 import { BLENDSHAPE_NAMES, LANDMARK_COUNT } from "./facePipeline";
 import { RESEARCH_PROTOCOL } from "../protocol";
 import type { AnnotationSample, AuditEvent, FeatureQaReport, InvalidFaceSegment, QaReport, SessionMetadata } from "../types";
+import { LABEL_SCALE_VERSION } from "../version";
 
 const FATAL_FACE_FLAGS = ["identity_roi_mismatch", "partially_out_of_crop", "face_too_small", "non_finite_landmarks"] as const;
 
@@ -156,9 +157,10 @@ export function buildQaReport(samples: AnnotationSample[], metadata: SessionMeta
     if (!indexInRange) unexpected.push(sample.sampleIndex);
     if (indexInRange && Math.abs(sample.targetTime - expectedTarget) <= 1e-6) validTimelineIndices.add(sample.sampleIndex);
     if (index > 0 && Math.abs(sample.targetTime - samples[index - 1].targetTime - 1 / metadata.samplingHz) > 0.001) irregular.push(sample.sampleIndex);
-    if (sample.valenceRaw === null || sample.arousalRaw === null || Math.abs(sample.valenceRaw) > 1 || Math.abs(sample.arousalRaw) > 1) missingLabel.push(sample.sampleIndex);
+    if (!isValidLabel(sample.valenceRaw) || !isValidLabel(sample.arousalRaw)) missingLabel.push(sample.sampleIndex);
     else validLabels += 1;
-    if (smoothed[index]?.valenceSmoothed !== null && smoothed[index]?.arousalSmoothed !== null) validProcessedLabels += 1;
+    if (isValidLabel(smoothed[index]?.valenceSmoothed ?? null)
+      && isValidLabel(smoothed[index]?.arousalSmoothed ?? null)) validProcessedLabels += 1;
     const invalidReasons = invalidFaceReasons(sample);
     if (invalidReasons.includes("identity_roi_mismatch")) invalidIdentity.push(sample.sampleIndex);
     if (invalidReasons.includes("invalid_source_timestamp")) invalidSourceTime.push(sample.sampleIndex);
@@ -181,6 +183,12 @@ export function buildQaReport(samples: AnnotationSample[], metadata: SessionMeta
   const featureVariation = meanConsecutiveVariation(validFeatureVectors);
   const rejectionReasons: string[] = [];
   const warnings: string[] = [];
+  if (metadata.labelScaleMin !== RESEARCH_PROTOCOL.labelScaleMin
+    || metadata.labelScaleMax !== RESEARCH_PROTOCOL.labelScaleMax
+    || metadata.labelNeutralValue !== RESEARCH_PROTOCOL.labelNeutralValue
+    || metadata.labelScaleVersion !== LABEL_SCALE_VERSION) {
+    rejectionReasons.push("標註量尺設定不是 0–1（中性值 0.5）");
+  }
   if (timelineCompleteness < RESEARCH_PROTOCOL.minimumTimelineCompleteness) rejectionReasons.push("時間軸完整率低於 99%");
   if (labelCompleteness < RESEARCH_PROTOCOL.minimumLabelCompleteness) rejectionReasons.push("V/A 標註完整率低於 99%");
   if (processedLabelCompleteness < RESEARCH_PROTOCOL.minimumLabelCompleteness) rejectionReasons.push("延遲校正後標註完整率低於 99%");
@@ -192,10 +200,10 @@ export function buildQaReport(samples: AnnotationSample[], metadata: SessionMeta
   if (irregular.length) rejectionReasons.push("時間步長不是固定 0.1 秒");
   const constantValenceRuns = countConstantRuns(samples.map((sample) => sample.valenceRaw));
   const constantArousalRuns = countConstantRuns(samples.map((sample) => sample.arousalRaw));
-  const valenceJumps = countJumps(samples.map((sample) => sample.valenceRaw));
-  const arousalJumps = countJumps(samples.map((sample) => sample.arousalRaw));
+  const valenceJumps = countJumps(samples.map((sample) => sample.valenceRaw), RESEARCH_PROTOCOL.maximumLabelStep);
+  const arousalJumps = countJumps(samples.map((sample) => sample.arousalRaw), RESEARCH_PROTOCOL.maximumLabelStep);
   if (constantValenceRuns || constantArousalRuns) warnings.push("存在連續 5 秒以上未移動的標註");
-  if (valenceJumps || arousalJumps) warnings.push("存在單一時間步超過 0.5 的標註跳變");
+  if (valenceJumps || arousalJumps) warnings.push(`存在單一時間步超過 ${RESEARCH_PROTOCOL.maximumLabelStep} 的標註跳變`);
   return {
     passed: rejectionReasons.length === 0,
     sampleCount: samples.length,
@@ -231,6 +239,7 @@ export function buildCsv(samples: AnnotationSample[], metadata: SessionMetadata)
     "participant_id", "session_id", "stimulus_id", "trial_id", "anonymous_video_id",
     "sample_index", "target_time_sec", "source_frame_index", "source_timestamp_sec",
     "valence_raw", "arousal_raw", "valence_smoothed", "arousal_smoothed", "label_valid",
+    "label_scale_min", "label_scale_max", "label_neutral_value", "label_scale_version",
     "face_detected", "detection_confidence", "tracking_confidence", "quality_flags",
     "identity_match", "roi_overlap",
     "interpolated", "exclusion_reason", "roi_x", "roi_y", "roi_size",
@@ -250,7 +259,8 @@ export function buildCsv(samples: AnnotationSample[], metadata: SessionMetadata)
       metadata.participantId, metadata.sessionId, metadata.stimulusId, metadata.trialId, metadata.anonymousVideoId,
       sample.sampleIndex, sample.targetTime, sample.sourceFrameIndex, sample.sourceTimestamp,
       sample.valenceRaw, sample.arousalRaw, smoothed[index].valenceSmoothed, smoothed[index].arousalSmoothed,
-      sample.valenceRaw !== null && sample.arousalRaw !== null,
+      isValidLabel(sample.valenceRaw) && isValidLabel(sample.arousalRaw),
+      metadata.labelScaleMin, metadata.labelScaleMax, metadata.labelNeutralValue, metadata.labelScaleVersion,
       sample.faceDetected, sample.detectionConfidence, sample.trackingConfidence, sample.qualityFlags.join("|"),
       sample.identityMatch, sample.roiOverlap,
       sample.interpolated, sample.exclusionReason, sample.roi?.x, sample.roi?.y, sample.roi?.size,
@@ -283,12 +293,19 @@ export function downloadText(content: string, filename: string, type = "text/pla
 const flattenPoints = (points: AnnotationSample["landmarks"]) => points.flatMap((p) => [p.x, p.y, p.z ?? 0]);
 const pad = (values: number[], size: number) => [...values, ...Array(Math.max(0, size - values.length)).fill(null)].slice(0, size);
 
-function countJumps(values: Array<number | null>) {
+function countJumps(values: Array<number | null>, threshold: number) {
   let count = 0;
   for (let i = 1; i < values.length; i += 1) {
-    if (values[i] !== null && values[i - 1] !== null && Math.abs(values[i]! - values[i - 1]!) > 0.5) count += 1;
+    if (values[i] !== null && values[i - 1] !== null && Math.abs(values[i]! - values[i - 1]!) > threshold) count += 1;
   }
   return count;
+}
+
+function isValidLabel(label: number | null) {
+  return label !== null
+    && Number.isFinite(label)
+    && label >= RESEARCH_PROTOCOL.labelScaleMin
+    && label <= RESEARCH_PROTOCOL.labelScaleMax;
 }
 
 function countConstantRuns(values: Array<number | null>, minimum = 50) {

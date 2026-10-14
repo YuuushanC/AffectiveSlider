@@ -89,6 +89,10 @@ export interface SessionMetadata {
   samplingHz: number;
   annotationDelaySec: number;
   smoothingWindowSec: number;
+  labelScaleMin: number;
+  labelScaleMax: number;
+  labelNeutralValue: number;
+  labelScaleVersion: string;
   annotatedAt: string;
   toolVersion: string;
   landmarkModelVersion: string;

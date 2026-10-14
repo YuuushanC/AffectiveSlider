@@ -1,6 +1,11 @@
 export const RESEARCH_PROTOCOL = Object.freeze({
-  protocolVersion: "continuous-affect-v2",
+  protocolVersion: "continuous-affect-v3",
   samplingHz: 10,
+  labelScaleMin: 0,
+  labelScaleMax: 1,
+  labelNeutralValue: 0.5,
+  // 0.25 of the full scale preserves the previous jump-warning sensitivity.
+  maximumLabelStep: 0.25,
   smoothingWindowSec: 0.5,
   // Replace only after the pilot study, then bump protocolVersion. Never vary by participant/fold.
   annotationDelaySec: 0,

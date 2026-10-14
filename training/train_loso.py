@@ -36,10 +36,25 @@ def ccc(y_true: np.ndarray, y_pred: np.ndarray) -> float:
 
 def load_data(paths: list[Path]) -> pd.DataFrame:
     frame = pd.concat((pd.read_csv(path, dtype={"participant_id": str}) for path in paths), ignore_index=True)
-    required = {"participant_id", "session_id", "anonymous_video_id", "sample_index", "valence_smoothed", "arousal_smoothed", "face_detected", "identity_match"}
+    required = {
+        "participant_id", "session_id", "anonymous_video_id", "sample_index",
+        "valence_smoothed", "arousal_smoothed", "face_detected", "identity_match",
+        "label_scale_min", "label_scale_max", "label_neutral_value", "label_scale_version",
+    }
     missing = required - set(frame.columns)
     if missing:
-        raise ValueError(f"Missing schema 2 columns: {sorted(missing)}")
+        raise ValueError(f"Missing schema 2.4 columns: {sorted(missing)}")
+    scale_versions = set(frame["label_scale_version"].dropna().astype(str))
+    if scale_versions != {"unit-interval-v1"}:
+        raise ValueError(f"Expected label_scale_version=unit-interval-v1, found {sorted(scale_versions)}")
+    if not ((frame["label_scale_min"] == 0).all()
+            and (frame["label_scale_max"] == 1).all()
+            and (frame["label_neutral_value"] == 0.5).all()):
+        raise ValueError("All inputs must declare the 0..1 label scale with neutral value 0.5")
+    labels = frame[["valence_smoothed", "arousal_smoothed"]]
+    outside_scale = labels.notna() & ((labels < 0) | (labels > 1))
+    if outside_scale.any().any():
+        raise ValueError("Valence/arousal labels outside the declared 0..1 scale were found")
     duplicates = frame.duplicated(GROUP_KEYS + ["sample_index"])
     if duplicates.any():
         raise ValueError("Duplicate participant/session/video/sample_index keys found")

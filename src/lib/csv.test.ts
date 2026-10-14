@@ -8,7 +8,7 @@ import type { AnnotationSample, SessionMetadata } from "../types";
 const complete = (sample: AnnotationSample): AnnotationSample => ({
   ...sample,
   valenceRaw: sample.sampleIndex / 10,
-  arousalRaw: -sample.sampleIndex / 10,
+  arousalRaw: 1 - sample.sampleIndex / 10,
   faceDetected: true,
   identityMatch: true,
   roiOverlap: 0.8,
@@ -24,7 +24,8 @@ const metadata = {
   anonymousVideoId: "v1", biologicalSex: "F", stimulusEmotion: "happy", stimulusOrder: 1,
   experimentalCondition: "test", sourceVideoSizeBytes: 1234, videoDurationSec: 0.9,
   clipStartSec: 0, clipEndSec: 0.9, sourceFps: null, samplingHz: 10, annotationDelaySec: 0,
-  smoothingWindowSec: 0.5, annotatedAt: "2026-01-01T00:00:00Z", toolVersion: "test",
+  smoothingWindowSec: 0.5, labelScaleMin: 0, labelScaleMax: 1, labelNeutralValue: 0.5,
+  labelScaleVersion: "unit-interval-v1", annotatedAt: "2026-01-01T00:00:00Z", toolVersion: "test",
   landmarkModelVersion: "test", schemaVersion: "2.1", processingVersion: "test",
   protocolVersion: "test", targetConstruct: "continuous_affect_trajectory",
   browserFamily: "Chrome", browserMajorVersion: "140", operatingSystem: "iPadOS",
@@ -55,6 +56,21 @@ describe("canonical 10 Hz dataset", () => {
     const samples = [...createTimeline(0, 0.9).values()].map(complete);
     expect(buildQaReport(samples, metadata).passed).toBe(true);
     expect(buildQaReport([...samples, samples[0]], metadata).rejectionReasons).toContain("存在重複 sample_index");
+  });
+
+  it("rejects labels outside the declared 0 to 1 scale", () => {
+    const samples = [...createTimeline(0, 0.9).values()].map(complete);
+    samples[0] = { ...samples[0], valenceRaw: -0.01 };
+    samples[1] = { ...samples[1], arousalRaw: 1.01 };
+    const qa = buildQaReport(samples, metadata);
+    expect(qa.missingLabelSamples).toEqual([0, 1]);
+    expect(qa.rejectionReasons).toContain("V/A 標註完整率低於 99%");
+  });
+
+  it("rejects metadata that declares a different label scale", () => {
+    const samples = [...createTimeline(0, 0.9).values()].map(complete);
+    const qa = buildQaReport(samples, { ...metadata, labelScaleMin: -1, labelNeutralValue: 0 });
+    expect(qa.rejectionReasons).toContain("標註量尺設定不是 0–1（中性值 0.5）");
   });
 
   it("rejects samples outside the canonical timeline even if all expected rows exist", () => {
@@ -114,22 +130,25 @@ describe("canonical 10 Hz dataset", () => {
   it("reconstructs labels causally without copying future slider values backward", () => {
     const samples = [...createTimeline(0, 0.4).values()];
     const labels = reconstructCausalLabels(samples, [
-      { mediaTime: 0, value: -0.5 },
+      { mediaTime: 0, value: 0.25 },
       { mediaTime: 0.21, value: 0.75 },
     ]);
-    expect(labels).toEqual([-0.5, -0.5, -0.5, 0.75, 0.75]);
+    expect(labels).toEqual([0.25, 0.25, 0.25, 0.75, 0.75]);
   });
 
   it("applies a fixed response-delay shift without altering raw labels", () => {
-    const samples = [...createTimeline(0, 0.4).values()].map((s, i) => ({ ...s, valenceRaw: i, arousalRaw: i }));
+    const samples = [...createTimeline(0, 0.4).values()].map((s, i) => ({ ...s, valenceRaw: i / 10, arousalRaw: i / 10 }));
     const shifted = smoothLabels(samples, 1, 2);
-    expect(shifted[0].valenceSmoothed).toBe(2);
+    expect(shifted[0].valenceSmoothed).toBe(0.2);
     expect(samples[0].valenceRaw).toBe(0);
   });
 
   it("exports one CSV row per canonical sample", () => {
     const samples = [...createTimeline(0, 0.2).values()].map(complete);
-    expect(buildCsv(samples, { ...metadata, clipEndSec: 0.2, videoDurationSec: 0.2 }).split("\n")).toHaveLength(4);
+    const csv = buildCsv(samples, { ...metadata, clipEndSec: 0.2, videoDurationSec: 0.2 });
+    expect(csv.split("\n")).toHaveLength(4);
+    expect(csv.split("\n")[0]).toContain("label_scale_version");
+    expect(csv.split("\n")[1]).toContain("unit-interval-v1");
   });
 
   it("packages one ZIP with dataset, QA metadata and checksums", async () => {

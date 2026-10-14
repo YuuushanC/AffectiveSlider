@@ -44,14 +44,14 @@ npm run build
 1. 上傳 MP4 並設定研究片段起訖點。
 2. 框選受試者第一幀完整臉部並保留約 20–30% 空間作為身份錨點；工具會以此初始化移動搜尋視窗，遺失追蹤時依序擴大範圍並在連續三個樣本失敗後使用全畫面重新鎖定。虛線框是起始錨點，提取與標註階段的實線框才是每個 10 Hz 樣本的實際偵測位置。
 3. 工具依固定 10 Hz canonical timestamps seek、解碼並完成一次特徵提取，接著立即顯示特徵 QA。未達 95% 或特徵無時間變異時會鎖定 V/A 標註，避免完成兩輪標註後才發現臉部特徵不可用。
-4. 分兩次播放標註 Valence 與 Arousal。滑桿事件以 causal zero-order hold 對齊同一組 `sample_index`，不使用未來值回填。
+4. 分兩次播放標註 Valence 與 Arousal。兩個維度皆使用 `0.00–1.00`，中性起點為 `0.50`；滑桿事件以 causal zero-order hold 對齊同一組 `sample_index`，不使用未來值回填。
 5. 填寫匿名 participant/session/stimulus/trial 資訊並執行 QA。
 6. QA 未通過時，ZIP 只含報告與拒絕原因；通過時才包含 `dataset.csv`。
 7. 在平板「檔案」中確認 ZIP 存在後再按「結束 session」，此時才清除本機暫存。
 
 暫停、播放、seek、slider 修改與掉幀補記均寫入 metadata 的 audit events。臉部未偵測或來源幀跳過時保留空值及原因，不以前一幀冒充有效資料。
 
-## ZIP 與 Schema 2.2
+## ZIP 與 Schema 2.4
 
 通過 QA 的 ZIP 包含：
 
@@ -61,7 +61,9 @@ npm run build
 
 輸出不保存原始影片檔名，只保存匿名影片 ID、影片長度與檔案大小。MediaPipe Web API 不公開逐幀偵測／追蹤信心，因此欄位維持空值並標記 `model_confidence_not_exposed`。瀏覽器也沒有可靠的容器原始 frame index，`source_frame_index` 維持空值；不可用播放累計幀冒充。
 
-標註延遲、平滑視窗與 QA 門檻集中在 `src/protocol.ts`。先導研究決定延遲後必須更新 protocol version，不可逐參與者或逐 fold 修改。
+標註延遲、平滑視窗、`0–1` 標籤範圍與 QA 門檻集中在 `src/protocol.ts`。CSV 每列及 session metadata 都會保存量尺下限、上限、中性值與量尺版本。先導研究決定延遲後必須更新 protocol version，不可逐參與者或逐 fold 修改。
+
+版本 0.6 起 V/A 由舊的 `-1–1` 改為 `0–1`，換算公式為 `new = (old + 1) / 2`。同一 processing version 的舊本機暫存會自動換算；既有已匯出的舊 ZIP 不會被改寫，合併分析前必須依 `label_scale_version` 分辨並轉換。
 
 版本 0.5 起使用解析度相對的臉部大小門檻，並只在超過容許比例的 landmark 明顯越界時標記 `partially_out_of_crop`。處理版本更新後，舊本機暫存會保留剪輯、ROI 與表單，但強制重新提取特徵，避免把舊演算法結果標成新版本。
 

@@ -25,7 +25,7 @@ import { clampRect, createFaceLandmarker, detectFace, LANDMARK_MODEL_VERSION } f
 import { advanceTrackingRoi, faceSearchPlan, trackedRoiForTime } from "./lib/tracking";
 import { RESEARCH_PROTOCOL } from "./protocol";
 import type { AnnotationSample, AuditEvent, FeatureQaReport, Mode, Rect, SessionMetadata, Step } from "./types";
-import { PROCESSING_VERSION, SCHEMA_VERSION, TOOL_VERSION } from "./version";
+import { LABEL_SCALE_VERSION, PROCESSING_VERSION, SCHEMA_VERSION, TOOL_VERSION } from "./version";
 
 const FPS = RESEARCH_PROTOCOL.samplingHz;
 const round2 = (value: number) => Number(value.toFixed(2));
@@ -43,8 +43,8 @@ export function App() {
   const drawRef = useRef<number | null>(null);
   const landmarkerRef = useRef<Awaited<ReturnType<typeof createFaceLandmarker>> | null>(null);
   const modeRef = useRef<Mode>(null);
-  const valenceRef = useRef(0);
-  const arousalRef = useRef(0);
+  const valenceRef = useRef(RESEARCH_PROTOCOL.labelNeutralValue);
+  const arousalRef = useRef(RESEARCH_PROTOCOL.labelNeutralValue);
   const eventsRef = useRef<AuditEvent[]>([]);
   const labelTrajectoryRef = useRef<Record<"valence" | "arousal", Array<{ mediaTime: number; value: number }>>>({ valence: [], arousal: [] });
   const extractionCancelledRef = useRef(false);
@@ -59,8 +59,8 @@ export function App() {
   const [roi, setRoi] = useState<Rect | null>(null);
   const [dragStart, setDragStart] = useState<{ x: number; y: number } | null>(null);
   const [mode, setMode] = useState<Mode>(null);
-  const [valence, setValence] = useState(0);
-  const [arousal, setArousal] = useState(0);
+  const [valence, setValence] = useState(RESEARCH_PROTOCOL.labelNeutralValue);
+  const [arousal, setArousal] = useState(RESEARCH_PROTOCOL.labelNeutralValue);
   const [valenceDone, setValenceDone] = useState(false);
   const [arousalDone, setArousalDone] = useState(false);
   const [samples, setSamples] = useState<Map<number, AnnotationSample>>(new Map());
@@ -148,7 +148,8 @@ export function App() {
     if (!videoFile || duration <= 0 || exportSuccess) return;
     const timeout = window.setTimeout(() => {
       const draft: SessionDraft = {
-        draftVersion: 2,
+        draftVersion: 3,
+        labelScaleVersion: LABEL_SCALE_VERSION,
         processingVersion: PROCESSING_VERSION,
         savedAt: new Date().toISOString(),
         videoFingerprint: fingerprintVideo(videoFile),
@@ -601,6 +602,10 @@ export function App() {
       clipStartSec: clipStart, clipEndSec: clipEnd, sourceFps: null, samplingHz: RESEARCH_PROTOCOL.samplingHz,
       annotationDelaySec: RESEARCH_PROTOCOL.annotationDelaySec,
       smoothingWindowSec: RESEARCH_PROTOCOL.smoothingWindowSec,
+      labelScaleMin: RESEARCH_PROTOCOL.labelScaleMin,
+      labelScaleMax: RESEARCH_PROTOCOL.labelScaleMax,
+      labelNeutralValue: RESEARCH_PROTOCOL.labelNeutralValue,
+      labelScaleVersion: LABEL_SCALE_VERSION,
       annotatedAt: new Date().toISOString(),
       toolVersion: TOOL_VERSION, landmarkModelVersion: LANDMARK_MODEL_VERSION,
       schemaVersion: SCHEMA_VERSION, processingVersion: PROCESSING_VERSION,
@@ -642,8 +647,10 @@ export function App() {
     setValenceDone(false);
     setArousalDone(false);
     setMode(null);
-    setValence(0);
-    setArousal(0);
+    setValence(RESEARCH_PROTOCOL.labelNeutralValue);
+    setArousal(RESEARCH_PROTOCOL.labelNeutralValue);
+    valenceRef.current = RESEARCH_PROTOCOL.labelNeutralValue;
+    arousalRef.current = RESEARCH_PROTOCOL.labelNeutralValue;
     setParticipantId("");
     setSequenceNumber("");
     setGender("M");
@@ -1015,7 +1022,15 @@ function AffectiveControl({ label, low, high, value, disabled, onChange }: { lab
         <strong>{label}</strong>
         <span>{value.toFixed(2)}</span>
       </div>
-      <Slider label="" min={-1} max={1} step={0.01} value={value} disabled={disabled} onChange={(e) => onChange(round2(Number(e.target.value)))} />
+      <Slider
+        label=""
+        min={RESEARCH_PROTOCOL.labelScaleMin}
+        max={RESEARCH_PROTOCOL.labelScaleMax}
+        step={0.01}
+        value={value}
+        disabled={disabled}
+        onChange={(e) => onChange(round2(Number(e.target.value)))}
+      />
       <div className="affective-ends">
         <span>{low}</span>
         <span>{high}</span>
