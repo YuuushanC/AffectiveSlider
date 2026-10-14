@@ -1,5 +1,9 @@
-import { LANDMARK_COUNT } from "./facePipeline";
-import type { AnnotationSample, AuditEvent, QaReport, SessionMetadata } from "../types";
+import { BLENDSHAPE_NAMES, LANDMARK_COUNT } from "./facePipeline";
+import { RESEARCH_PROTOCOL } from "../protocol";
+import type { AnnotationSample, AuditEvent, FeatureQaReport, InvalidFaceSegment, QaReport, SessionMetadata } from "../types";
+import { LABEL_SCALE_VERSION } from "../version";
+
+const FATAL_FACE_FLAGS = ["identity_roi_mismatch", "partially_out_of_crop", "face_too_small", "non_finite_landmarks"] as const;
 
 const GEOMETRY_HEADERS = [
   "face_width", "eye_distance", "left_eye_open", "right_eye_open",
@@ -25,6 +29,8 @@ export function createTimeline(clipStart: number, clipEnd: number, samplingHz = 
       valenceRaw: null,
       arousalRaw: null,
       faceDetected: false,
+      identityMatch: false,
+      roiOverlap: null,
       detectionConfidence: null,
       trackingConfidence: null,
       qualityFlags: ["not_processed"],
@@ -35,6 +41,7 @@ export function createTimeline(clipStart: number, clipEnd: number, samplingHz = 
       normalizedLandmarks: [],
       headPose: { pitch: null, yaw: null, roll: null },
       geometry: {},
+      blendshapes: {},
     }];
   }));
 }
@@ -42,6 +49,7 @@ export function createTimeline(clipStart: number, clipEnd: number, samplingHz = 
 export function smoothLabels(samples: AnnotationSample[], windowSamples = 5, delaySamples = 0) {
   const radius = Math.floor(windowSamples / 2);
   const meanAt = (key: "valenceRaw" | "arousalRaw", index: number) => {
+    if (index < 0 || index >= samples.length) return null;
     const values = samples.slice(Math.max(0, index - radius), index + radius + 1)
       .map((sample) => sample[key]).filter((v): v is number => v !== null);
     return values.length ? values.reduce((a, b) => a + b, 0) / values.length : null;
@@ -53,36 +61,149 @@ export function smoothLabels(samples: AnnotationSample[], windowSamples = 5, del
   }));
 }
 
-export function buildQaReport(samples: AnnotationSample[], expectedCount: number): QaReport {
+export function reconstructCausalLabels(
+  samples: AnnotationSample[],
+  trajectory: Array<{ mediaTime: number; value: number }>,
+) {
+  const ordered = [...trajectory].sort((a, b) => a.mediaTime - b.mediaTime);
+  let eventIndex = 0;
+  return samples.map((sample) => {
+    while (eventIndex + 1 < ordered.length && ordered[eventIndex + 1].mediaTime <= sample.targetTime + 1e-6) eventIndex += 1;
+    return ordered.length > 0 && ordered[eventIndex].mediaTime <= sample.targetTime + 1e-6
+      ? ordered[eventIndex].value
+      : null;
+  });
+}
+
+export function invalidFaceReasons(sample: AnnotationSample) {
+  const reasons: string[] = [];
+  if (!sample.faceDetected) {
+    reasons.push("face_not_detected");
+  } else {
+    if (!sample.identityMatch) reasons.push("identity_roi_mismatch");
+    for (const flag of FATAL_FACE_FLAGS) {
+      if (sample.qualityFlags.includes(flag)) reasons.push(flag);
+    }
+    if (sample.landmarks.length !== LANDMARK_COUNT || sample.normalizedLandmarks.length !== LANDMARK_COUNT) {
+      reasons.push("landmark_count_mismatch");
+    }
+    if (!allPointsFinite(sample.landmarks) || !allPointsFinite(sample.normalizedLandmarks)) {
+      reasons.push("non_finite_landmarks");
+    }
+  }
+  const sourceTimestampIsMeasured = !sample.qualityFlags.includes("source_timestamp_current_time_fallback");
+  if (!sourceTimestampIsMeasured || sample.sourceTimestamp === null
+    || Math.abs(sample.sourceTimestamp - sample.targetTime) > RESEARCH_PROTOCOL.maximumSourceTimeErrorSec) {
+    reasons.push("invalid_source_timestamp");
+  }
+  return [...new Set(reasons)];
+}
+
+export function buildFeatureQaReport(samples: AnnotationSample[]): FeatureQaReport {
+  const invalid = samples
+    .map((sample) => ({ sample, reasons: invalidFaceReasons(sample) }))
+    .filter(({ reasons }) => reasons.length > 0);
+  const validSamples = samples.filter((sample) => invalidFaceReasons(sample).length === 0);
+  const validFeatureVectors = validSamples.map((sample) => (
+    sample.normalizedLandmarks.flatMap((point) => [point.x, point.y, point.z ?? 0])
+  ));
+  const validFaceRate = validSamples.length / Math.max(1, samples.length);
+  const featureVariation = meanConsecutiveVariation(validFeatureVectors);
+  const rejectionReasons: string[] = [];
+  if (validFaceRate < RESEARCH_PROTOCOL.minimumValidFaceRate) rejectionReasons.push("目標受試者有效臉部特徵率低於 95%");
+  if (validFeatureVectors.length < 2) rejectionReasons.push("有效臉部特徵不足以檢查時間變異");
+  else if (featureVariation < 1e-5) rejectionReasons.push("正規化臉部特徵缺乏時間變異");
+  return {
+    passed: rejectionReasons.length === 0,
+    sampleCount: samples.length,
+    validFaceCount: validSamples.length,
+    invalidFaceCount: invalid.length,
+    validFaceRate,
+    featureVariation,
+    invalidReasonCounts: countInvalidReasons(invalid),
+    invalidFaceSegments: buildInvalidFaceSegments(invalid),
+    rejectionReasons,
+  };
+}
+
+export function buildQaReport(samples: AnnotationSample[], metadata: SessionMetadata): QaReport {
+  const expectedCount = Math.floor((metadata.clipEndSec - metadata.clipStartSec) * metadata.samplingHz) + 1;
   const seen = new Set<number>();
   const duplicates: number[] = [];
+  const unexpected: number[] = [];
   const irregular: number[] = [];
   const missingFace: number[] = [];
   const missingLabel: number[] = [];
+  const invalidIdentity: number[] = [];
+  const invalidSourceTime: number[] = [];
+  const nonFiniteFeature: number[] = [];
   const validTimelineIndices = new Set<number>();
   let validLabels = 0;
   let validFaces = 0;
+  const smoothed = smoothLabels(
+    samples,
+    Math.max(1, Math.round(metadata.smoothingWindowSec * metadata.samplingHz)),
+    Math.max(0, Math.round(metadata.annotationDelaySec * metadata.samplingHz)),
+  );
+  let validProcessedLabels = 0;
+  const validFeatureVectors: number[][] = [];
+  const invalidFaceDetails: Array<{ sample: AnnotationSample; reasons: string[] }> = [];
   for (let index = 0; index < samples.length; index += 1) {
     const sample = samples[index];
     if (seen.has(sample.sampleIndex)) duplicates.push(sample.sampleIndex);
     seen.add(sample.sampleIndex);
-    if (sample.sampleIndex >= 0 && sample.sampleIndex < expectedCount && Number.isFinite(sample.targetTime)) validTimelineIndices.add(sample.sampleIndex);
-    if (index > 0 && Math.abs(sample.targetTime - samples[index - 1].targetTime - 0.1) > 0.001) irregular.push(sample.sampleIndex);
-    if (sample.valenceRaw === null || sample.arousalRaw === null) missingLabel.push(sample.sampleIndex);
+    const expectedTarget = metadata.clipStartSec + sample.sampleIndex / metadata.samplingHz;
+    const indexInRange = Number.isInteger(sample.sampleIndex) && sample.sampleIndex >= 0 && sample.sampleIndex < expectedCount;
+    if (!indexInRange) unexpected.push(sample.sampleIndex);
+    if (indexInRange && Math.abs(sample.targetTime - expectedTarget) <= 1e-6) validTimelineIndices.add(sample.sampleIndex);
+    if (index > 0 && Math.abs(sample.targetTime - samples[index - 1].targetTime - 1 / metadata.samplingHz) > 0.001) irregular.push(sample.sampleIndex);
+    if (!isValidLabel(sample.valenceRaw) || !isValidLabel(sample.arousalRaw)) missingLabel.push(sample.sampleIndex);
     else validLabels += 1;
-    if (!sample.faceDetected || sample.landmarks.length !== LANDMARK_COUNT) missingFace.push(sample.sampleIndex);
-    else validFaces += 1;
+    if (isValidLabel(smoothed[index]?.valenceSmoothed ?? null)
+      && isValidLabel(smoothed[index]?.arousalSmoothed ?? null)) validProcessedLabels += 1;
+    const invalidReasons = invalidFaceReasons(sample);
+    if (invalidReasons.includes("identity_roi_mismatch")) invalidIdentity.push(sample.sampleIndex);
+    if (invalidReasons.includes("invalid_source_timestamp")) invalidSourceTime.push(sample.sampleIndex);
+    if (invalidReasons.includes("non_finite_landmarks") || invalidReasons.includes("landmark_count_mismatch")) nonFiniteFeature.push(sample.sampleIndex);
+    const validFace = invalidReasons.length === 0;
+    if (!validFace) missingFace.push(sample.sampleIndex);
+    if (!validFace) invalidFaceDetails.push({ sample, reasons: invalidReasons });
+    else {
+      validFaces += 1;
+      validFeatureVectors.push(sample.normalizedLandmarks.flatMap((point) => [point.x, point.y, point.z ?? 0]));
+    }
   }
   const denominator = Math.max(1, expectedCount);
   const timelineCompleteness = validTimelineIndices.size / denominator;
   const labelCompleteness = validLabels / denominator;
   const validFaceRate = validFaces / denominator;
+  const delaySamples = Math.max(0, Math.round(metadata.annotationDelaySec * metadata.samplingHz));
+  const processedDenominator = Math.max(1, expectedCount - delaySamples);
+  const processedLabelCompleteness = validProcessedLabels / processedDenominator;
+  const featureVariation = meanConsecutiveVariation(validFeatureVectors);
   const rejectionReasons: string[] = [];
-  if (timelineCompleteness < 0.99) rejectionReasons.push("時間軸完整率低於 99%");
-  if (labelCompleteness < 0.99) rejectionReasons.push("V/A 標註完整率低於 99%");
-  if (validFaceRate < 0.95) rejectionReasons.push("有效臉部特徵率低於 95%");
+  const warnings: string[] = [];
+  if (metadata.labelScaleMin !== RESEARCH_PROTOCOL.labelScaleMin
+    || metadata.labelScaleMax !== RESEARCH_PROTOCOL.labelScaleMax
+    || metadata.labelNeutralValue !== RESEARCH_PROTOCOL.labelNeutralValue
+    || metadata.labelScaleVersion !== LABEL_SCALE_VERSION) {
+    rejectionReasons.push("標註量尺設定不是 0–1（中性值 0.5）");
+  }
+  if (timelineCompleteness < RESEARCH_PROTOCOL.minimumTimelineCompleteness) rejectionReasons.push("時間軸完整率低於 99%");
+  if (labelCompleteness < RESEARCH_PROTOCOL.minimumLabelCompleteness) rejectionReasons.push("V/A 標註完整率低於 99%");
+  if (processedLabelCompleteness < RESEARCH_PROTOCOL.minimumLabelCompleteness) rejectionReasons.push("延遲校正後標註完整率低於 99%");
+  if (validFaceRate < RESEARCH_PROTOCOL.minimumValidFaceRate) rejectionReasons.push("目標受試者有效臉部特徵率低於 95%");
+  if (validFeatureVectors.length < 2) rejectionReasons.push("有效臉部特徵不足以檢查時間變異");
+  else if (featureVariation < 1e-5) rejectionReasons.push("正規化臉部特徵缺乏時間變異");
   if (duplicates.length) rejectionReasons.push("存在重複 sample_index");
+  if (samples.length !== expectedCount || unexpected.length) rejectionReasons.push("樣本數量或 sample_index 超出 canonical 時間軸");
   if (irregular.length) rejectionReasons.push("時間步長不是固定 0.1 秒");
+  const constantValenceRuns = countConstantRuns(samples.map((sample) => sample.valenceRaw));
+  const constantArousalRuns = countConstantRuns(samples.map((sample) => sample.arousalRaw));
+  const valenceJumps = countJumps(samples.map((sample) => sample.valenceRaw), RESEARCH_PROTOCOL.maximumLabelStep);
+  const arousalJumps = countJumps(samples.map((sample) => sample.arousalRaw), RESEARCH_PROTOCOL.maximumLabelStep);
+  if (constantValenceRuns || constantArousalRuns) warnings.push("存在連續 5 秒以上未移動的標註");
+  if (valenceJumps || arousalJumps) warnings.push(`存在單一時間步超過 ${RESEARCH_PROTOCOL.maximumLabelStep} 的標註跳變`);
   return {
     passed: rejectionReasons.length === 0,
     sampleCount: samples.length,
@@ -90,15 +211,24 @@ export function buildQaReport(samples: AnnotationSample[], expectedCount: number
     timelineCompleteness,
     labelCompleteness,
     validFaceRate,
+    processedLabelCompleteness,
+    featureVariation,
     duplicateSampleIndices: duplicates,
+    unexpectedSampleIndices: unexpected,
     irregularTimeSteps: irregular,
     missingFaceSamples: missingFace,
     missingLabelSamples: missingLabel,
-    constantValenceRuns: countConstantRuns(samples.map((s) => s.valenceRaw)),
-    constantArousalRuns: countConstantRuns(samples.map((s) => s.arousalRaw)),
-    valenceJumps: countJumps(samples.map((s) => s.valenceRaw)),
-    arousalJumps: countJumps(samples.map((s) => s.arousalRaw)),
+    invalidIdentitySamples: invalidIdentity,
+    invalidSourceTimeSamples: invalidSourceTime,
+    nonFiniteFeatureSamples: nonFiniteFeature,
+    invalidReasonCounts: countInvalidReasons(invalidFaceDetails),
+    invalidFaceSegments: buildInvalidFaceSegments(invalidFaceDetails),
+    constantValenceRuns,
+    constantArousalRuns,
+    valenceJumps,
+    arousalJumps,
     rejectionReasons,
+    warnings,
   };
 }
 
@@ -109,10 +239,12 @@ export function buildCsv(samples: AnnotationSample[], metadata: SessionMetadata)
     "participant_id", "session_id", "stimulus_id", "trial_id", "anonymous_video_id",
     "sample_index", "target_time_sec", "source_frame_index", "source_timestamp_sec",
     "valence_raw", "arousal_raw", "valence_smoothed", "arousal_smoothed", "label_valid",
+    "label_scale_min", "label_scale_max", "label_neutral_value", "label_scale_version",
     "face_detected", "detection_confidence", "tracking_confidence", "quality_flags",
+    "identity_match", "roi_overlap",
     "interpolated", "exclusion_reason", "roi_x", "roi_y", "roi_size",
     "head_pitch_deg", "head_yaw_deg", "head_roll_deg",
-    ...rawHeaders, ...normalizedHeaders, ...GEOMETRY_HEADERS,
+    ...rawHeaders, ...normalizedHeaders, ...GEOMETRY_HEADERS, ...BLENDSHAPE_NAMES.map((name) => `bs_${name}`),
     "tool_version", "landmark_model_version", "schema_version", "processing_version",
   ];
   const smoothed = smoothLabels(
@@ -127,12 +259,15 @@ export function buildCsv(samples: AnnotationSample[], metadata: SessionMetadata)
       metadata.participantId, metadata.sessionId, metadata.stimulusId, metadata.trialId, metadata.anonymousVideoId,
       sample.sampleIndex, sample.targetTime, sample.sourceFrameIndex, sample.sourceTimestamp,
       sample.valenceRaw, sample.arousalRaw, smoothed[index].valenceSmoothed, smoothed[index].arousalSmoothed,
-      sample.valenceRaw !== null && sample.arousalRaw !== null,
+      isValidLabel(sample.valenceRaw) && isValidLabel(sample.arousalRaw),
+      metadata.labelScaleMin, metadata.labelScaleMax, metadata.labelNeutralValue, metadata.labelScaleVersion,
       sample.faceDetected, sample.detectionConfidence, sample.trackingConfidence, sample.qualityFlags.join("|"),
+      sample.identityMatch, sample.roiOverlap,
       sample.interpolated, sample.exclusionReason, sample.roi?.x, sample.roi?.y, sample.roi?.size,
       sample.headPose.pitch, sample.headPose.yaw, sample.headPose.roll,
       ...pad(raw, LANDMARK_COUNT * 3), ...pad(normalized, LANDMARK_COUNT * 3),
       ...GEOMETRY_HEADERS.map((key) => sample.geometry[key]),
+      ...BLENDSHAPE_NAMES.map((name) => sample.blendshapes[name]),
       metadata.toolVersion, metadata.landmarkModelVersion, metadata.schemaVersion, metadata.processingVersion,
     ].map(value).join(",");
   });
@@ -158,12 +293,19 @@ export function downloadText(content: string, filename: string, type = "text/pla
 const flattenPoints = (points: AnnotationSample["landmarks"]) => points.flatMap((p) => [p.x, p.y, p.z ?? 0]);
 const pad = (values: number[], size: number) => [...values, ...Array(Math.max(0, size - values.length)).fill(null)].slice(0, size);
 
-function countJumps(values: Array<number | null>) {
+function countJumps(values: Array<number | null>, threshold: number) {
   let count = 0;
   for (let i = 1; i < values.length; i += 1) {
-    if (values[i] !== null && values[i - 1] !== null && Math.abs(values[i]! - values[i - 1]!) > 0.5) count += 1;
+    if (values[i] !== null && values[i - 1] !== null && Math.abs(values[i]! - values[i - 1]!) > threshold) count += 1;
   }
   return count;
+}
+
+function isValidLabel(label: number | null) {
+  return label !== null
+    && Number.isFinite(label)
+    && label >= RESEARCH_PROTOCOL.labelScaleMin
+    && label <= RESEARCH_PROTOCOL.labelScaleMax;
 }
 
 function countConstantRuns(values: Array<number | null>, minimum = 50) {
@@ -177,4 +319,54 @@ function countConstantRuns(values: Array<number | null>, minimum = 50) {
     }
   }
   return count;
+}
+
+function allPointsFinite(points: AnnotationSample["landmarks"]) {
+  return points.length > 0 && points.every((point) => Number.isFinite(point.x) && Number.isFinite(point.y) && Number.isFinite(point.z ?? 0));
+}
+
+function countInvalidReasons(details: Array<{ reasons: string[] }>) {
+  const counts: Record<string, number> = {};
+  for (const { reasons } of details) {
+    for (const reason of reasons) counts[reason] = (counts[reason] ?? 0) + 1;
+  }
+  return counts;
+}
+
+function buildInvalidFaceSegments(
+  details: Array<{ sample: AnnotationSample; reasons: string[] }>,
+): InvalidFaceSegment[] {
+  const ordered = [...details].sort((a, b) => a.sample.sampleIndex - b.sample.sampleIndex);
+  const segments: InvalidFaceSegment[] = [];
+  for (const detail of ordered) {
+    const last = segments.at(-1);
+    if (!last || detail.sample.sampleIndex !== last.endSampleIndex + 1) {
+      segments.push({
+        startSampleIndex: detail.sample.sampleIndex,
+        endSampleIndex: detail.sample.sampleIndex,
+        startTimeSec: detail.sample.targetTime,
+        endTimeSec: detail.sample.targetTime,
+        sampleCount: 1,
+        reasons: [...detail.reasons],
+      });
+      continue;
+    }
+    last.endSampleIndex = detail.sample.sampleIndex;
+    last.endTimeSec = detail.sample.targetTime;
+    last.sampleCount += 1;
+    last.reasons = [...new Set([...last.reasons, ...detail.reasons])];
+  }
+  return segments;
+}
+
+function meanConsecutiveVariation(vectors: number[][]) {
+  if (vectors.length < 2) return 0;
+  let total = 0;
+  let comparisons = 0;
+  for (let index = 1; index < vectors.length; index += 1) {
+    if (vectors[index].length !== vectors[index - 1].length) continue;
+    total += vectors[index].reduce((sum, value, point) => sum + Math.abs(value - vectors[index - 1][point]), 0) / vectors[index].length;
+    comparisons += 1;
+  }
+  return comparisons ? total / comparisons : 0;
 }

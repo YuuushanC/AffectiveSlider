@@ -1,0 +1,28 @@
+export const RESEARCH_PROTOCOL = Object.freeze({
+  protocolVersion: "continuous-affect-v3",
+  samplingHz: 10,
+  labelScaleMin: 0,
+  labelScaleMax: 1,
+  labelNeutralValue: 0.5,
+  // 0.25 of the full scale preserves the previous jump-warning sensitivity.
+  maximumLabelStep: 0.25,
+  smoothingWindowSec: 0.5,
+  // Replace only after the pilot study, then bump protocolVersion. Never vary by participant/fold.
+  annotationDelaySec: 0,
+  minimumTimelineCompleteness: 0.99,
+  minimumLabelCompleteness: 0.99,
+  minimumValidFaceRate: 0.95,
+  maximumSourceTimeErrorSec: 0.055,
+  trackedSearchPadding: 0.75,
+  expandedSearchPadding: 1.35,
+  wideSearchPadding: 2,
+  fullFrameSearchAfterMisses: 3,
+  cropBoundaryTolerance: 0.035,
+  maximumCropBoundaryOutlierFraction: 0.02,
+  minimumFaceFrameRatio: 0.075,
+  minimumFacePixelsFloor: 48,
+  minimumFacePixelsCeiling: 96,
+  minimumWindowValidFaceRate: 0.95,
+  maximumWindowConsecutiveMissing: 2,
+  targetConstruct: "continuous_affect_trajectory",
+});
