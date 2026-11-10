@@ -8,6 +8,7 @@ const DRAFT_KEY = "active-session";
 const DATABASE_VERSION = 1;
 
 export interface SessionDraft {
+  sliderCalibration?: import("./sliderCalibration").SliderCalibration | null;
   draftVersion: 3;
   processingVersion: string;
   labelScaleVersion: string;

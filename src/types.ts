@@ -72,6 +72,7 @@ export interface FeatureQaReport {
 }
 
 export interface SessionMetadata {
+  sliderCalibration?: import("./lib/sliderCalibration").SliderCalibration | null;
   participantId: string;
   sessionId: string;
   stimulusId: string;

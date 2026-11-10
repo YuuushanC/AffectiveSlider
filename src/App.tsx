@@ -17,6 +17,8 @@ import { Badge } from "./components/ui/badge";
 import { Button } from "./components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "./components/ui/card";
 import { Slider } from "./components/ui/slider";
+import { SliderCalibration } from "./components/SliderCalibration";
+import type { SliderCalibration as CalibrationRecord } from "./lib/sliderCalibration";
 import { buildFeatureQaReport, buildQaReport, createTimeline, invalidFaceReasons, reconstructCausalLabels } from "./lib/csv";
 import { readClientEnvironment, readCompatibilityIssues } from "./lib/clientEnvironment";
 import { clearDraft, fingerprintVideo, loadDraft, saveDraft, type SessionDraft } from "./lib/draftStore";
@@ -70,6 +72,8 @@ export function App() {
   const [isExportOpen, setIsExportOpen] = useState(false);
   const [gender, setGender] = useState("M");
   const [participantId, setParticipantId] = useState("");
+  const [calibration, setCalibration] = useState<CalibrationRecord | null>(null);
+  const sessionCalibrations = useRef(new Map<string, CalibrationRecord>());
   const [sequenceNumber, setSequenceNumber] = useState("");
   const [exportError, setExportError] = useState("");
   const [modelStatus, setModelStatus] = useState<"loading" | "ready" | "error">("loading");
@@ -149,6 +153,7 @@ export function App() {
     const timeout = window.setTimeout(() => {
       const draft: SessionDraft = {
         draftVersion: 3,
+        sliderCalibration: calibration,
         labelScaleVersion: LABEL_SCALE_VERSION,
         processingVersion: PROCESSING_VERSION,
         savedAt: new Date().toISOString(),
@@ -177,7 +182,7 @@ export function App() {
   }, [
     videoFile, duration, clipStart, clipEnd, step, roi, samples, mode, valence, arousal,
     valenceDone, arousalDone, gender, participantId, sequenceNumber, sessionId, stimulusId,
-    trialId, stimulusEmotion, experimentalCondition, draftRevision, exportSuccess,
+    trialId, stimulusEmotion, experimentalCondition, draftRevision, exportSuccess, calibration,
   ]);
 
   useEffect(() => {
@@ -237,6 +242,8 @@ export function App() {
     if (videoUrl) URL.revokeObjectURL(videoUrl);
     const url = URL.createObjectURL(file);
     setVideoFile(file);
+    setCalibration(null);
+    setParticipantId("");
     setVideoUrl(url);
     setDuration(0);
     setClipStart(0);
@@ -281,6 +288,8 @@ export function App() {
       eventsRef.current = draft.auditEvents;
       setGender(draft.form.gender);
       setParticipantId(draft.form.participantId);
+      const saved = draft.sliderCalibration;
+      setCalibration(saved?.participantId === draft.form.participantId ? saved : null);
       setSequenceNumber(draft.form.sequenceNumber);
       setSessionId(draft.form.sessionId);
       setStimulusId(draft.form.stimulusId);
@@ -601,6 +610,7 @@ export function App() {
       sourceVideoSizeBytes: videoFile?.size ?? 0, videoDurationSec: duration,
       clipStartSec: clipStart, clipEndSec: clipEnd, sourceFps: null, samplingHz: RESEARCH_PROTOCOL.samplingHz,
       annotationDelaySec: RESEARCH_PROTOCOL.annotationDelaySec,
+      sliderCalibration: calibration,
       smoothingWindowSec: RESEARCH_PROTOCOL.smoothingWindowSec,
       labelScaleMin: RESEARCH_PROTOCOL.labelScaleMin,
       labelScaleMax: RESEARCH_PROTOCOL.labelScaleMax,
@@ -652,6 +662,7 @@ export function App() {
     valenceRef.current = RESEARCH_PROTOCOL.labelNeutralValue;
     arousalRef.current = RESEARCH_PROTOCOL.labelNeutralValue;
     setParticipantId("");
+    setCalibration(null);
     setSequenceNumber("");
     setGender("M");
     setSessionId("");
@@ -839,8 +850,19 @@ export function App() {
                 </div>
               ) : null}
 
-              {step === "annotate" ? (
+              {step === "annotate" && !annotationBlocked && !calibration && !mode && !valenceDone && !arousalDone ? (
+                <SliderCalibration participantId={participantId} setParticipantId={setParticipantId}
+                  previous={sessionCalibrations.current.get(participantId)}
+                  mediaTime={() => videoRef.current?.currentTime ?? clipStart}
+                  onComplete={record => {
+                    setCalibration(record);
+                    if (record.medianMs.valence !== null && record.medianMs.arousal !== null)
+                      sessionCalibrations.current.set(record.participantId, record);
+                  }}/>
+              ) : step === "annotate" ? (
                 <div className="control-stack">
+                  {calibration && !mode && !valenceDone && !arousalDone && <Button variant="outline"
+                    onClick={() => setCalibration(null)}>重新校準或更換受試者</Button>}
                   {featureQa ? <FeatureQaCard report={featureQa} onReview={reviewFeatureSegment} /> : null}
                   <div className="mode-tabs">
                     <Button disabled={annotationBlocked} variant={mode === "valence" ? "default" : "outline"} onClick={() => selectMode("valence")}>
@@ -913,7 +935,7 @@ export function App() {
               <div className="dialog-fields">
                 <label>
                   <span>參與者編號 ID</span>
-                  <input value={participantId} placeholder="001" inputMode="numeric" onChange={(e) => setParticipantId(e.target.value.replace(/\D/g, ""))} />
+                  <input value={participantId} readOnly={Boolean(calibration)} placeholder="001" inputMode="numeric" onChange={(e) => setParticipantId(e.target.value.replace(/\D/g, ""))} />
                 </label>
                 <label>
                   <span>流水號 Seq</span>

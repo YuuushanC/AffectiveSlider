@@ -999,3 +999,6 @@ input[type="range"]::-webkit-slider-thumb {
     grid-template-columns: 1fr;
   }
 }
+.slider-calibration { display: grid; gap: .85rem; }
+.slider-calibration label { display: grid; gap: .35rem; }
+.calibration-cue { display: block; min-height: 2em; text-align: center; font-size: 1.35rem; }
