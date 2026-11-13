@@ -2,14 +2,20 @@
 <html lang="zh-Hant">
   <head>
     <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <link rel="preconnect" href="https://fonts.googleapis.com" />
-    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-    <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+TC:wght@400;500;600;700&display=swap" rel="stylesheet" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+    <meta name="robots" content="noindex,nofollow,noarchive" />
+    <meta name="theme-color" content="#0f9f87" />
     <title>Affective Slider 標註工具</title>
   </head>
   <body>
-    <div id="root"></div>
+    <div id="root">
+      <main style="min-height:100vh;display:grid;place-items:center;padding:24px;background:#f7fafc;color:#0f172a;font-family:system-ui,-apple-system,'Segoe UI',sans-serif">
+        <section style="width:min(100%,560px);padding:28px;border:1px solid #dbe3ea;border-radius:16px;background:white;box-shadow:0 18px 48px rgba(15,23,42,.08)">
+          <h1 style="margin:0 0 12px;font-size:24px">Affective Slider 正在載入</h1>
+          <p style="margin:0;line-height:1.7;color:#475569">若此訊息沒有自動消失，表示你直接開啟了原始 <code>index.html</code>。請使用 HTTPS 正式網址；本機檢查請先執行 <code>npm run dev</code>，再開啟 <code>http://localhost:5173</code>。</p>
+        </section>
+      </main>
+    </div>
     <script type="module" src="/src/main.tsx"></script>
   </body>
 </html>
